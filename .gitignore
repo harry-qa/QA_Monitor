@@ -1,0 +1,5 @@
+dist/
+crash_history.json
+install_history.json
+__pycache__/
+*.pyc
