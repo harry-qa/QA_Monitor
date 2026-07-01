@@ -98,6 +98,12 @@ CRASH_EVENT_IDS = {
     1026: '.NET Runtime',
     7031: 'Service 비정상 종료',
     7034: 'Service 비정상 종료',
+    7000: 'Service 시작 실패',
+    7009: 'Service 시작 시간 초과',
+    7011: 'Service 응답 시간 초과',
+    7022: 'Service 시작 중 멈춤',
+    7023: 'Service 오류 종료',
+    7024: 'Service 오류 종료',
 }
 
 INSTALL_EVENT_IDS = {
@@ -368,6 +374,12 @@ class EventLogWatcher:
                    '앱 경로', 'Report ID'],
             7031: ['서비스 이름', '종료 횟수', '복구 동작'],
             7034: ['서비스 이름', '종료 횟수'],
+            7000: ['서비스 이름', '오류 내용'],
+            7009: ['시간 제한(ms)', '서비스 이름'],
+            7011: ['시간 제한(ms)', '서비스 이름'],
+            7022: ['서비스 이름'],
+            7023: ['서비스 이름', '오류 내용'],
+            7024: ['서비스 이름', '서비스 특정 오류'],
         }
         keys  = labels.get(eid, [])
         lines = []
@@ -400,10 +412,13 @@ class EventLogWatcher:
         return EZLAB_APPS.get(proc.lower(), proc)
 
     def _parse(self, ts, eid, msg, detail, inserts: list) -> Optional[CrashEvent]:
-        if eid == 1026:          return self._dotnet(ts, msg, detail, inserts)
-        if eid == 1000:          return self._appcrash(ts, msg, detail, inserts)
-        if eid == 1002:          return self._hang(ts, msg, detail, inserts)
-        if eid in (7031, 7034):  return self._service(ts, msg, detail, inserts)
+        if eid == 1026:               return self._dotnet(ts, msg, detail, inserts)
+        if eid == 1000:               return self._appcrash(ts, msg, detail, inserts)
+        if eid == 1002:               return self._hang(ts, msg, detail, inserts)
+        if eid in (7031, 7034):       return self._service(ts, msg, detail, inserts)
+        if eid in (7000, 7023, 7024): return self._service_error(ts, eid, msg, detail, inserts)
+        if eid in (7009, 7011):       return self._service_timeout(ts, eid, msg, detail, inserts)
+        if eid == 7022:               return self._service_hang(ts, msg, detail, inserts)
         return None
 
     @staticmethod
@@ -506,6 +521,34 @@ class EventLogWatcher:
         return CrashEvent(ts, self._resolve(svc),  svc,
                           '서비스 비정상 종료',
                           f'{svc} 서비스가 예기치 않게 종료됨', detail)
+
+    def _service_error(self, ts, eid, msg, detail, inserts) -> Optional[CrashEvent]:
+        # 7000(시작 실패)/7023/7024(오류 종료) inserts[0]=서비스 이름, [1]=오류 내용
+        svc = self._ins(inserts, 0)
+        err = self._ins(inserts, 1)
+        if not svc:
+            return None
+        label = CRASH_EVENT_IDS[eid]
+        return CrashEvent(ts, self._resolve(svc), svc, label,
+                          f'{svc} — {err}' if err else f'{svc} {label}', detail)
+
+    def _service_timeout(self, ts, eid, msg, detail, inserts) -> Optional[CrashEvent]:
+        # 7009(시작 시간 초과)/7011(응답 시간 초과) inserts[0]=시간 제한(ms), [1]=서비스 이름
+        timeout = self._ins(inserts, 0)
+        svc     = self._ins(inserts, 1)
+        if not svc:
+            return None
+        label = CRASH_EVENT_IDS[eid]
+        return CrashEvent(ts, self._resolve(svc), svc, label,
+                          f'{timeout}ms 동안 응답 없음' if timeout else f'{svc} {label}', detail)
+
+    def _service_hang(self, ts, msg, detail, inserts) -> Optional[CrashEvent]:
+        # 7022 inserts[0]=서비스 이름
+        svc = self._ins(inserts, 0)
+        if not svc:
+            return None
+        return CrashEvent(ts, self._resolve(svc), svc, '서비스 시작 중 멈춤',
+                          f'{svc} 서비스가 시작 중 응답 없음', detail)
 
 
 # ── 유틸 ─────────────────────────────────────────────────────────
