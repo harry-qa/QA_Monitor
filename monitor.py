@@ -9,6 +9,7 @@ import sys
 import json
 import time
 import threading
+import subprocess
 import tkinter as tk
 from tkinter import ttk, scrolledtext
 from datetime import datetime
@@ -47,6 +48,13 @@ LOGO_ICO     = BASE_DIR / 'ezlab.ico'
 DATA_DIR     = Path(os.environ.get('LOCALAPPDATA', BASE_DIR)) / 'ezLab QA Monitor'
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 HISTORY_FILE = DATA_DIR / 'crash_history.json'
+
+# WER(Windows Error Reporting)이 자동 저장하는 크래시 덤프(.dmp) 위치.
+# 서비스 계정이 크래시해도 항상 같은 경로를 쓰도록 %LOCALAPPDATA%가 아니라
+# 사용자와 무관한 %ProgramData%를 쓴다 (인스톨러가 이 경로로 LocalDumps를 등록함).
+DUMP_DIR          = Path(os.environ.get('ProgramData', r'C:\ProgramData')) / 'ezLab QA Monitor' / 'Dumps'
+DUMP_ANALYZER_EXE = BASE_DIR / 'DumpAnalyzer.exe'
+MAX_DUMP_FILES    = 20  # 오래된 덤프는 자동 삭제, 최근 N개만 보관
 
 APP_AUMID    = 'EzLab.QAMonitor'
 APP_NAME     = 'ezLab QA Monitor'
@@ -213,15 +221,19 @@ def load_history() -> List[CrashEvent]:
         return []
 
 
-def append_to_history(ev: CrashEvent) -> None:
-    history = load_history()
-    history.append(ev)
+def save_history(history: List[CrashEvent]) -> None:
     if len(history) > MAX_HISTORY_ENTRIES:
         history = history[-MAX_HISTORY_ENTRIES:]
     try:
         _atomic_write_json(HISTORY_FILE, [_to_dict(e) for e in history])
     except Exception:
         pass
+
+
+def append_to_history(ev: CrashEvent) -> None:
+    history = load_history()
+    history.append(ev)
+    save_history(history)
 
 
 def load_install_history() -> List[InstallEvent]:
@@ -575,6 +587,68 @@ class EventLogWatcher:
                           f'{svc} 서비스가 시작 중 응답 없음', detail)
 
 
+# ── 크래시 덤프 감시 (ClrMD 기반 관리 코드 스택 트레이스 자동 분석) ──
+class DumpWatcher:
+    """WER LocalDumps가 떨어뜨린 .dmp 파일을 감시하다가 DumpAnalyzer.exe로
+    관리 코드 스택 트레이스를 뽑아 콜백으로 전달한다. 오래된 덤프는 자동 정리."""
+
+    def __init__(self, on_stack_trace: Callable[[str, datetime, str], None]):
+        self._on_stack_trace = on_stack_trace
+        self._seen: set = set()
+        self._stop = threading.Event()
+
+    def start(self):
+        threading.Thread(target=self._loop, daemon=True, name='DumpWatcher').start()
+
+    def stop(self):
+        self._stop.set()
+
+    def _loop(self):
+        while not self._stop.wait(POLL_SECONDS):
+            try:
+                self._poll()
+            except Exception:
+                pass
+
+    def _poll(self):
+        if not DUMP_DIR.exists():
+            return
+        dumps = sorted(DUMP_DIR.glob('*.dmp'), key=lambda p: p.stat().st_mtime)
+
+        for dmp in dumps:
+            if dmp.name in self._seen:
+                continue
+            self._seen.add(dmp.name)
+            self._analyze(dmp)
+
+        # 보관 개수 제한: 오래된 것부터 정리
+        dumps = sorted(DUMP_DIR.glob('*.dmp'), key=lambda p: p.stat().st_mtime)
+        for old in dumps[:-MAX_DUMP_FILES] if len(dumps) > MAX_DUMP_FILES else []:
+            try:
+                old.unlink()
+            except Exception:
+                pass
+
+    def _analyze(self, dmp_path: Path):
+        if not DUMP_ANALYZER_EXE.exists():
+            return
+        # WER 기본 파일명 형식: <프로세스exe>.<PID>.dmp
+        proc_name = dmp_path.stem.rsplit('.', 1)[0]
+        try:
+            result = subprocess.run(
+                [str(DUMP_ANALYZER_EXE), str(dmp_path)],
+                capture_output=True, text=True, timeout=90,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+            text = (result.stdout or '').strip()
+        except Exception:
+            return
+        if not text or text.startswith(('NO_CLR_RUNTIME_FOUND', 'NO_MANAGED_THREAD_FOUND', 'ANALYZER_ERROR')):
+            return
+        ts = datetime.fromtimestamp(dmp_path.stat().st_mtime)
+        self._on_stack_trace(proc_name, ts, text)
+
+
 # ── 유틸 ─────────────────────────────────────────────────────────
 def _make_report(ev: CrashEvent) -> str:
     sep = '═' * 52
@@ -801,20 +875,60 @@ class HistoryWindow:
             return
 
         for app_name, events in sorted(grouped.items()):
-            # 앱 그룹 헤더
-            grp = tk.Frame(self._install_frame, bg=PANEL)
-            grp.pack(fill=tk.X, padx=16, pady=(12, 0))
+            latest = events[0]
 
-            tk.Label(grp, text=app_name,
+            # 카드 컨테이너 (헤더 + 접히는 행 영역)
+            card = tk.Frame(self._install_frame, bg=PANEL)
+            card.pack(fill=tk.X, padx=16, pady=(12, 0))
+
+            # 나중에 pack/pack_forget을 반복해도 항상 이 카드 바로 아래에
+            # 위치하도록 after=card로 고정한다 (pack은 기본적으로 맨 뒤에
+            # 추가되므로, 지정 없이 다시 pack하면 목록 맨 아래로 밀려남).
+            rows_frame = tk.Frame(self._install_frame, bg=BG)
+            rows_frame.pack(fill=tk.X, padx=16, after=card)
+            rows_frame.pack_forget()
+            expanded = [False]
+
+            def _toggle(rf=rows_frame, btn_ref=None, state=expanded, after_widget=card):
+                state[0] = not state[0]
+                if state[0]:
+                    rf.pack(fill=tk.X, padx=16, after=after_widget)
+                    btn_ref.config(text='▾')
+                else:
+                    rf.pack_forget()
+                    btn_ref.config(text='▸')
+
+            hdr = tk.Frame(card, bg=PANEL, cursor='hand2')
+            hdr.pack(fill=tk.X)
+
+            toggle_btn = tk.Label(hdr, text='▸', font=('Segoe UI', 9, 'bold'),
+                                   bg=PANEL, fg=SUBTLE, padx=6)
+            toggle_btn.pack(side=tk.LEFT, padx=(8, 0), pady=8)
+
+            tk.Label(hdr, text=app_name,
                      font=('Segoe UI', 10, 'bold'), bg=PANEL, fg=FG,
-                     padx=14, pady=8, anchor=tk.W
-                     ).pack(fill=tk.X)
+                     pady=8, anchor=tk.W
+                     ).pack(side=tk.LEFT)
 
-            # 이벤트 행
+            tk.Label(hdr, text=f'{len(events)}건',
+                     font=('Segoe UI', 8), bg=PANEL, fg=MUTED
+                     ).pack(side=tk.LEFT, padx=8)
+
+            latest_color = GREEN if latest.action == '설치' else YELLOW if latest.action == '업데이트' else RED
+            tk.Label(hdr, text=f'최근: {latest.action} · {latest.version}',
+                     font=('Segoe UI', 8), bg=PANEL, fg=latest_color
+                     ).pack(side=tk.RIGHT, padx=14)
+
+            for w in (hdr, toggle_btn):
+                w.bind('<Button-1>', lambda e, b=toggle_btn: _toggle(btn_ref=b))
+            for child in hdr.winfo_children():
+                child.bind('<Button-1>', lambda e, b=toggle_btn: _toggle(btn_ref=b))
+
+            # 이벤트 행 (기본은 접혀있음, 헤더 클릭 시 펼침)
             for ev in events:
-                row = tk.Frame(self._install_frame, bg=CARD)
-                row.pack(fill=tk.X, padx=16)
-                tk.Frame(self._install_frame, bg=BORDER, height=1).pack(fill=tk.X, padx=16)
+                row = tk.Frame(rows_frame, bg=CARD)
+                row.pack(fill=tk.X)
+                tk.Frame(rows_frame, bg=BORDER, height=1).pack(fill=tk.X)
 
                 action_color = GREEN if ev.action == '설치' else YELLOW if ev.action == '업데이트' else RED
                 # 액션 뱃지
@@ -1233,6 +1347,14 @@ class HistoryWindow:
                 w('0xC0000005: ACCESS_VIOLATION\n', 'exc')
                 w('→ 잘못된 주소 역참조 또는 버퍼 오버플로우가 원인일 수 있습니다.\n', 'warn')
 
+            stack_lines = [l.strip() for l in ev.detail.splitlines() if l.strip().startswith('at ')]
+            if stack_lines:
+                w('\n')
+                w('관리 코드 스택 트레이스 (덤프 자동 분석)\n', 'section')
+                w('─' * 46 + '\n', 'sep')
+                for line in stack_lines:
+                    w(f'  {line}\n', 'stack')
+
         elif ev.error_type == '응답 없음 (Hang)':
             w('원인 분석\n', 'section')
             w('─' * 46 + '\n', 'sep')
@@ -1284,6 +1406,7 @@ class QAMonitor:
         self._lock = threading.Lock()
         self._icon: Optional[pystray.Icon] = None
         self._watcher = EventLogWatcher(self._on_crash, self._on_install, self._on_poll)
+        self._dump_watcher = DumpWatcher(self._on_stack_trace)
         self._open_window: Optional[HistoryWindow] = None
         self._last_checked: Optional[datetime] = None
         self._consec_fail  = 0
@@ -1291,6 +1414,7 @@ class QAMonitor:
 
     def run(self):
         self._watcher.start()
+        self._dump_watcher.start()
 
         menu = pystray.Menu(
             pystray.MenuItem('크래시 이력 보기', self._show_history, default=True),
@@ -1404,6 +1528,25 @@ class QAMonitor:
         if win:
             win.push_install(ev)
 
+    def _on_stack_trace(self, proc_name: str, dump_ts: datetime, stack_text: str):
+        # 덤프에서 분석해낸 관리 코드 스택 트레이스를, 시간/프로세스명이
+        # 가장 가까운 기존 크래시 이력에 덧붙인다. (열려있는 창은 다음에
+        # 다시 열 때 갱신된 내용을 보여준다 — 실시간 갱신은 하지 않음)
+        with self._lock:
+            match = None
+            for ev in reversed(self._history):
+                if (ev.process.lower() == proc_name.lower()
+                        and abs((ev.timestamp - dump_ts).total_seconds()) < 120):
+                    match = ev
+                    break
+            if match is None or '자동 분석된 관리 코드 스택 트레이스' in match.detail:
+                return
+            match.detail += (
+                '\n\n[자동 분석된 관리 코드 스택 트레이스]\n' + '─' * 48 + '\n' + stack_text
+            )
+            snapshot = list(self._history)
+        save_history(snapshot)
+
     def _show_history(self, icon=None, item=None):
         with self._lock:
             if self._open_window is not None:
@@ -1431,6 +1574,7 @@ class QAMonitor:
 
     def _quit(self, icon=None, item=None):
         self._watcher.stop()
+        self._dump_watcher.stop()
         if self._icon:
             self._icon.stop()
 

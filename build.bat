@@ -1,5 +1,14 @@
 @echo off
-echo [1/2] Starting Nuitka build...
+echo [1/3] Publishing DumpAnalyzer (ClrMD dump analysis helper)...
+dotnet publish DumpAnalyzer\DumpAnalyzer.csproj -c Release >NUL
+if errorlevel 1 (
+  echo DumpAnalyzer publish failed!
+  pause
+  exit /b 1
+)
+copy /Y "DumpAnalyzer\bin\Release\net8.0\win-x64\publish\DumpAnalyzer.exe" "DumpAnalyzer.exe" >NUL
+
+echo [2/3] Starting Nuitka build...
 
 python -m nuitka ^
   --standalone ^
@@ -8,6 +17,7 @@ python -m nuitka ^
   --windows-icon-from-ico=ezlab.ico ^
   --include-data-files=ezlab_logo.png=ezlab_logo.png ^
   --include-data-files=ezlab.ico=ezlab.ico ^
+  --include-data-files=DumpAnalyzer.exe=DumpAnalyzer.exe ^
   --enable-plugin=tk-inter ^
   --assume-yes-for-downloads ^
 --output-filename=ezLabQAMonitor.exe ^
@@ -21,6 +31,6 @@ if errorlevel 1 (
 )
 
 echo.
-echo [2/2] Build complete: dist\ezLabQAMonitor.exe
+echo [3/3] Build complete: dist\ezLabQAMonitor.exe
 echo To create the installer, compile installer.iss with Inno Setup.
 pause

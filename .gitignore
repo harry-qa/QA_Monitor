@@ -3,3 +3,10 @@ crash_history.json
 install_history.json
 __pycache__/
 *.pyc
+
+# build.bat이 DumpAnalyzer 프로젝트에서 매번 새로 publish하므로 커밋하지 않음
+DumpAnalyzer.exe
+DumpAnalyzer/bin/
+DumpAnalyzer/obj/
+CrashTest/bin/
+CrashTest/obj/
