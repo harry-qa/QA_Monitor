@@ -115,6 +115,10 @@ INSTALL_EVENT_IDS = {
 EVENT_LOGS   = ['Application', 'System']
 POLL_SECONDS = 3
 
+# 이벤트 로그 폴링이 연속 실패할 때 "감시가 멈췄을 수 있다"고 알려주는 기준
+POLL_FAIL_ALERT_THRESHOLD = 5    # 연속 실패 5회(약 15초) 시 최초 경고
+POLL_FAIL_ALERT_REPEAT    = 100  # 이후에도 계속 실패하면 100회(약 5분)마다 재경고
+
 # ── 라이트 테마 색상 ─────────────────────────────────────────────
 BG      = '#F4F6F8'   # 배경
 SURFACE = '#FFFFFF'   # 표면
@@ -187,6 +191,18 @@ def _install_from_dict(d: dict) -> InstallEvent:
 INSTALL_HISTORY_FILE = DATA_DIR / 'install_history.json'
 
 
+MAX_HISTORY_ENTRIES = 500  # 오래된 항목은 자동으로 정리하고 최근 N개만 보관
+
+
+def _atomic_write_json(path: Path, data) -> None:
+    # 쓰는 도중 강제 종료/크래시가 나도 기존 파일이 손상되지 않도록
+    # 임시 파일에 먼저 쓰고 os.replace()로 통째로 교체한다.
+    tmp = path.with_name(path.name + '.tmp')
+    with open(tmp, 'w', encoding='utf-8') as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+
+
 def load_history() -> List[CrashEvent]:
     if not HISTORY_FILE.exists():
         return []
@@ -200,10 +216,10 @@ def load_history() -> List[CrashEvent]:
 def append_to_history(ev: CrashEvent) -> None:
     history = load_history()
     history.append(ev)
+    if len(history) > MAX_HISTORY_ENTRIES:
+        history = history[-MAX_HISTORY_ENTRIES:]
     try:
-        with open(HISTORY_FILE, 'w', encoding='utf-8') as f:
-            json.dump([_to_dict(e) for e in history], f,
-                      ensure_ascii=False, indent=2)
+        _atomic_write_json(HISTORY_FILE, [_to_dict(e) for e in history])
     except Exception:
         pass
 
@@ -221,10 +237,10 @@ def load_install_history() -> List[InstallEvent]:
 def append_install_history(ev: InstallEvent) -> None:
     history = load_install_history()
     history.append(ev)
+    if len(history) > MAX_HISTORY_ENTRIES:
+        history = history[-MAX_HISTORY_ENTRIES:]
     try:
-        with open(INSTALL_HISTORY_FILE, 'w', encoding='utf-8') as f:
-            json.dump([_install_to_dict(e) for e in history], f,
-                      ensure_ascii=False, indent=2)
+        _atomic_write_json(INSTALL_HISTORY_FILE, [_install_to_dict(e) for e in history])
     except Exception:
         pass
 
@@ -232,9 +248,11 @@ def append_install_history(ev: InstallEvent) -> None:
 # ── 이벤트 로그 감시 ─────────────────────────────────────────────
 class EventLogWatcher:
     def __init__(self, on_event: Callable[[CrashEvent], None],
-                 on_install: Callable[[InstallEvent], None] = None):
+                 on_install: Callable[[InstallEvent], None] = None,
+                 on_poll: Callable[[bool], None] = None):
         self._on_event   = on_event
         self._on_install = on_install
+        self._on_poll    = on_poll
         self._stop       = threading.Event()
         self._last_record: dict = {}  # log_name -> last processed RecordNumber
 
@@ -246,10 +264,16 @@ class EventLogWatcher:
 
     def _loop(self):
         while not self._stop.wait(POLL_SECONDS):
+            ok = True
             try:
                 self._poll()
             except Exception:
-                pass
+                ok = False
+            if self._on_poll:
+                try:
+                    self._on_poll(ok)
+                except Exception:
+                    pass
 
     def _poll(self):
         for log_name in EVENT_LOGS:
@@ -1259,8 +1283,11 @@ class QAMonitor:
         self._install_history: List[InstallEvent] = load_install_history()
         self._lock = threading.Lock()
         self._icon: Optional[pystray.Icon] = None
-        self._watcher = EventLogWatcher(self._on_crash, self._on_install)
+        self._watcher = EventLogWatcher(self._on_crash, self._on_install, self._on_poll)
         self._open_window: Optional[HistoryWindow] = None
+        self._last_checked: Optional[datetime] = None
+        self._consec_fail  = 0
+        self._alert_showing = False
 
     def run(self):
         self._watcher.start()
@@ -1273,7 +1300,7 @@ class QAMonitor:
         self._icon = pystray.Icon(
             name='ezlab-qa-monitor',
             icon=self._make_tray_icon(alert=False),
-            title='ezLab QA Monitor — 감시 중',
+            title=self._idle_title(),
             menu=menu,
         )
 
@@ -1301,12 +1328,48 @@ class QAMonitor:
             except Exception:
                 pass
 
+    def _idle_title(self) -> str:
+        if self._last_checked:
+            return f'ezLab QA Monitor — 감시 중 (마지막 확인 {self._last_checked.strftime("%H:%M:%S")})'
+        return 'ezLab QA Monitor — 감시 중'
+
+    def _on_poll(self, ok: bool):
+        if ok:
+            self._consec_fail = 0
+            self._last_checked = datetime.now()
+            if self._icon and not self._alert_showing:
+                self._icon.title = self._idle_title()
+            return
+
+        self._consec_fail += 1
+        past_threshold = self._consec_fail - POLL_FAIL_ALERT_THRESHOLD
+        if past_threshold == 0 or (past_threshold > 0 and past_threshold % POLL_FAIL_ALERT_REPEAT == 0):
+            self._notify_watch_error()
+
+    def _notify_watch_error(self):
+        msg = 'Windows 이벤트 로그 읽기가 계속 실패하고 있습니다. 모니터링이 멈췄을 수 있습니다.'
+        if HAS_TOAST:
+            threading.Thread(
+                target=lambda: _toaster.show_toast(
+                    '[이지랩 QA] 모니터링 오류', msg,
+                    icon_path=str(LOGO_ICO) if LOGO_ICO.exists() else None,
+                    duration=8, threaded=False,
+                ),
+                daemon=True,
+            ).start()
+        elif self._icon:
+            try:
+                self._icon.notify(msg, title='[이지랩 QA] 모니터링 오류')
+            except Exception:
+                pass
+
     def _on_crash(self, ev: CrashEvent):
         with self._lock:
             self._history.append(ev)
             count = len(self._history)
             win = self._open_window
         append_to_history(ev)
+        self._alert_showing = True
 
         # 창이 열려 있으면 실시간으로 카드 추가
         if win:
@@ -1361,9 +1424,10 @@ class QAMonitor:
         threading.Thread(target=run_window, daemon=True, name='HistoryWindow').start()
 
     def _on_window_open(self):
+        self._alert_showing = False
         if self._icon:
             self._icon.icon  = self._make_tray_icon(alert=False)
-            self._icon.title = 'ezLab QA Monitor — 감시 중'
+            self._icon.title = self._idle_title()
 
     def _quit(self, icon=None, item=None):
         self._watcher.stop()
