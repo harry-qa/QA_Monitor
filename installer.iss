@@ -1,5 +1,8 @@
 #define AppName    "ezLab QA Monitor"
-#define AppVersion "1.0"
+; 버전은 VERSION 파일이 단일 출처 (monitor.py도 같은 파일을 읽는다)
+#define VerFile FileOpen(AddBackslash(SourcePath) + "VERSION")
+#define AppVersion Trim(FileRead(VerFile))
+#expr FileClose(VerFile)
 #define AppPublisher "harryQA"
 #define AppExeName "ezLabQAMonitor.exe"
 
@@ -70,10 +73,10 @@ const
   REG_OPTION_NON_VOLATILE = 0;
   REG_SZ                  = 1;
   REG_DWORD               = 4;
-  WerAppCount             = 14;
+  WerAppCount             = 15;
 
 var
-  WerAppNames: array[0..13] of String;
+  WerAppNames: array[0..14] of String;
 
 function RegCreateKeyExW(hKey: Longint; lpSubKey: String; Reserved: Longint;
   lpClass: Longint; dwOptions: Longint; samDesired: Longint;
@@ -111,6 +114,8 @@ begin
   WerAppNames[11] := 'ezmanager updator.exe';
   WerAppNames[12] := 'ezfinderservice.exe';
   WerAppNames[13] := 'ezmanagerservice.exe';
+  // 모니터 자신도 덤프를 남겨 자기 크래시를 추적할 수 있게 한다
+  WerAppNames[14] := 'ezlabqamonitor.exe';
 end;
 
 // 네이티브 64비트 뷰로 열어서 DumpFolder/DumpCount/DumpType을 쓴다.

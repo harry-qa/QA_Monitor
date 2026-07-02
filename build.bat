@@ -17,6 +17,7 @@ python -m nuitka ^
   --windows-icon-from-ico=ezlab.ico ^
   --include-data-files=ezlab_logo.png=ezlab_logo.png ^
   --include-data-files=ezlab.ico=ezlab.ico ^
+  --include-data-files=VERSION=VERSION ^
   --include-data-files=DumpAnalyzer.exe=DumpAnalyzer.exe ^
   --enable-plugin=tk-inter ^
   --assume-yes-for-downloads ^
