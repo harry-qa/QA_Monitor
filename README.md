@@ -8,7 +8,11 @@
 - 크래시 감지: APPCRASH(1000), AppHang(1002), .NET Runtime(1026)
 - 서비스 이상 감지: 비정상 종료(7031/7034), 시작 실패(7000), 시작/응답 시간 초과(7009/7011), 시작 중 멈춤(7022), 오류 종료(7023/7024)
 - 설치/삭제/업데이트 이력 감지: 1033/1034/1035 (앱별 아코디언 카드뷰로 확인)
+- **미실행 구간 백필**: 마지막으로 읽은 이벤트 로그 위치를 저장해두고, 모니터가 꺼져 있던 동안 발생한 크래시/설치 이벤트를 다음 실행 시 자동으로 따라잡아 기록 (합계 토스트 1회로 알림, 이벤트 로그 초기화 감지 시 안전하게 리셋)
 - **크래시 덤프 자동 분석**: WER(Windows Error Reporting)이 캡처한 덤프를 ClrMD 기반 헬퍼(`DumpAnalyzer`)로 분석해 관리 코드 스택 트레이스를 크래시 이력에 자동 첨부 (AccessViolation류처럼 이벤트 로그만으로는 스택이 안 남는 크래시용)
+- **상세 분석 탭**: 이벤트 캡처 시점에 로캘 무관 파라미터(앱/모듈/버전/예외 코드/오프셋/경로/Report ID)를 구조화 저장하고, 주요 예외 코드(ACCESS_VIOLATION, 힙 손상, 스택 버퍼 오버런, .NET 예외, 어설션 패닉 등)별 원인 설명을 자동 표시
+- 크래시 이력 앱/유형 필터, 크래시·설치 이력 CSV 내보내기(Excel 한글 호환), 개별/전체 삭제
+- 자기 감시: 모니터 자신의 크래시도 WER 덤프 등록 + 다음 실행 시 백필로 기록
 - 감지 시 트레이 토스트 알림
 - 감시 상태 표시: 트레이 툴팁에 마지막 폴링 시각 표시, 이벤트 로그 폴링이 연속 실패하면 "모니터링 오류" 토스트로 경고
 - 크래시/설치 이력은 `%LOCALAPPDATA%\ezLab QA Monitor\`에 원자적 쓰기로 영구 저장(강제종료 시에도 손상 방지), 최근 500건만 보관
@@ -16,7 +20,13 @@
 
 ## 모니터링 대상
 
-ezFinder, ezFinder Service, ezCapture, ezCam, ezMemo, ezZip, ezManager, ezManager Service (및 각 Updater)
+ezFinder, ezFinder Service, ezCapture, ezCam, ezMemo, ezZip, ezManager, ezManager Service (및 각 Updater), 그리고 모니터 자신
+
+신규 앱 추가 시 `monitor.py`의 `EZLAB_APPS`(이름 매핑)와 `installer.iss`의 `WerAppNames`(덤프 등록)에 exe 이름을 추가한 뒤 재빌드/재배포가 필요합니다.
+
+## 버전 관리
+
+버전은 루트의 `VERSION` 파일이 단일 출처입니다. 앱 헤더 표시(`monitor.py`)와 인스톨러 버전(`installer.iss`)이 모두 이 파일을 읽으므로, 릴리스 시 이 파일만 올리면 됩니다.
 
 ## 개발 환경
 
