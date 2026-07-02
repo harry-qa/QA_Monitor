@@ -11,7 +11,7 @@ import time
 import threading
 import subprocess
 import tkinter as tk
-from tkinter import ttk, scrolledtext
+from tkinter import ttk, scrolledtext, messagebox
 from datetime import datetime
 from dataclasses import dataclass, asdict
 from typing import Optional, List, Callable
@@ -246,15 +246,19 @@ def load_install_history() -> List[InstallEvent]:
         return []
 
 
-def append_install_history(ev: InstallEvent) -> None:
-    history = load_install_history()
-    history.append(ev)
+def save_install_history(history: List[InstallEvent]) -> None:
     if len(history) > MAX_HISTORY_ENTRIES:
         history = history[-MAX_HISTORY_ENTRIES:]
     try:
         _atomic_write_json(INSTALL_HISTORY_FILE, [_install_to_dict(e) for e in history])
     except Exception:
         pass
+
+
+def append_install_history(ev: InstallEvent) -> None:
+    history = load_install_history()
+    history.append(ev)
+    save_install_history(history)
 
 
 # ── 이벤트 로그 감시 ─────────────────────────────────────────────
@@ -667,10 +671,14 @@ def _make_report(ev: CrashEvent) -> str:
 class HistoryWindow:
     def __init__(self, history: List[CrashEvent],
                  install_history: List[InstallEvent] = None,
-                 on_open: Callable = None):
+                 on_open: Callable = None,
+                 on_delete_crash: Callable = None,
+                 on_delete_install: Callable = None):
         self._history         = history
         self._install_history = list(install_history or [])
         self._on_open         = on_open
+        self._on_delete_crash   = on_delete_crash
+        self._on_delete_install = on_delete_install
         self._selected: Optional[CrashEvent] = None
         self._card_frames: List[tk.Frame] = []
         self._card_tints:  List[str] = []
@@ -749,7 +757,7 @@ class HistoryWindow:
                 relief=tk.FLAT, bd=0, anchor=tk.W,
                 padx=16, pady=9, cursor='hand2',
                 activebackground=BORDER, activeforeground=FG)
-            hdr_btn.config(command=lambda b=hdr_btn: _toggle(btn_ref=b))
+            hdr_btn.config(command=lambda b=hdr_btn, fn=_toggle: fn(btn_ref=b))
             hdr_btn.pack(fill=tk.X)
             tk.Frame(grp, bg=BORDER, height=1).pack(fill=tk.X)
 
@@ -834,6 +842,10 @@ class HistoryWindow:
                  font=('Segoe UI', 10, 'bold'), bg=SURFACE, fg=FG).pack(side=tk.LEFT)
         tk.Label(hdr, text='MobSoft 제품만 표시됩니다',
                  font=('Segoe UI', 8), bg=SURFACE, fg=MUTED).pack(side=tk.LEFT, padx=12)
+        clear_all_lbl = tk.Label(hdr, text='전체 삭제', font=('Segoe UI', 8),
+                                  bg=SURFACE, fg=RED, cursor='hand2')
+        clear_all_lbl.pack(side=tk.RIGHT)
+        clear_all_lbl.bind('<Button-1>', lambda e: self._clear_all_install())
         tk.Frame(parent, bg=BORDER, height=1).pack(fill=tk.X)
 
         # 스크롤 영역
@@ -920,9 +932,9 @@ class HistoryWindow:
                      ).pack(side=tk.RIGHT, padx=14)
 
             for w in (hdr, toggle_btn):
-                w.bind('<Button-1>', lambda e, b=toggle_btn: _toggle(btn_ref=b))
+                w.bind('<Button-1>', lambda e, b=toggle_btn, fn=_toggle: fn(btn_ref=b))
             for child in hdr.winfo_children():
-                child.bind('<Button-1>', lambda e, b=toggle_btn: _toggle(btn_ref=b))
+                child.bind('<Button-1>', lambda e, b=toggle_btn, fn=_toggle: fn(btn_ref=b))
 
             # 이벤트 행 (기본은 접혀있음, 헤더 클릭 시 펼침)
             for ev in events:
@@ -948,7 +960,34 @@ class HistoryWindow:
                          font=('Segoe UI', 9), bg=CARD, fg=MUTED
                          ).pack(side=tk.RIGHT, padx=14)
 
+                del_lbl = tk.Label(row, text='✕', font=('Segoe UI', 9, 'bold'),
+                                    bg=CARD, fg=MUTED, cursor='hand2')
+                del_lbl.pack(side=tk.RIGHT, padx=(0, 4))
+                del_lbl.bind('<Button-1>', lambda e, ev=ev: self._delete_install(ev))
+
             tk.Frame(self._install_frame, bg=BORDER, height=1).pack(fill=tk.X, padx=16, pady=(0, 4))
+
+    def _delete_install(self, ev: InstallEvent):
+        if not messagebox.askyesno('삭제 확인',
+                                    f'{ev.app_name}  {ev.action} · {ev.version} 기록을 삭제할까요?'):
+            return
+        self._install_history.remove(ev)
+        if self._on_delete_install:
+            self._on_delete_install([ev])
+        self._rebuild_install_table()
+
+    def _clear_all_install(self):
+        if not self._install_history:
+            return
+        if not messagebox.askyesno(
+                '전체 삭제 확인',
+                f'설치/삭제 이력 전체 {len(self._install_history)}건을 삭제할까요?\n이 작업은 되돌릴 수 없습니다.'):
+            return
+        evs = list(self._install_history)
+        self._install_history.clear()
+        if self._on_delete_install:
+            self._on_delete_install(evs)
+        self._rebuild_install_table()
 
     # ── 스타일 ──
     def _setup_styles(self):
@@ -1025,6 +1064,10 @@ class HistoryWindow:
                  font=('Segoe UI', 9, 'bold'), bg=BG, fg=SUBTLE
                  ).pack(side=tk.LEFT)
 
+        clear_all_lbl = tk.Label(lhdr, text='전체 삭제', font=('Segoe UI', 8),
+                                  bg=BG, fg=RED, cursor='hand2')
+        clear_all_lbl.pack(side=tk.RIGHT)
+        clear_all_lbl.bind('<Button-1>', lambda e: self._clear_all_crash())
         tk.Frame(left, bg=BORDER, height=1).pack(fill=tk.X)
 
         # 스크롤 가능한 카드 영역
@@ -1233,8 +1276,52 @@ class HistoryWindow:
             w.bind('<Leave>',   lambda e, c=card, t=card_tint: self._restore_bg(c, t))
             w.bind('<MouseWheel>', self._on_mousewheel)
 
+        # 삭제 버튼 (선택 클릭과 겹치지 않도록 위 바인딩 루프 이후 별도 바인딩)
+        del_btn = tk.Label(badge_frame, text='✕', font=('Segoe UI', 8, 'bold'),
+                            bg=card_tint, fg=MUTED, cursor='hand2')
+        del_btn.pack(side=tk.RIGHT)
+        del_btn.bind('<Button-1>', lambda e, i=idx: self._delete_crash(i))
+
         self._card_frames.append(card)
         self._card_tints.append(card_tint)
+
+    def _delete_crash(self, idx: int):
+        if not messagebox.askyesno('삭제 확인', '이 크래시 이력을 삭제할까요?'):
+            return
+        ev = self._indexed.pop(idx)
+        if self._on_delete_crash:
+            self._on_delete_crash([ev])
+        self._rebuild_cards()
+        self._update_count()
+        if self._indexed:
+            self._select(min(idx, len(self._indexed) - 1))
+        else:
+            self._clear_detail()
+
+    def _clear_all_crash(self):
+        if not self._indexed:
+            return
+        if not messagebox.askyesno(
+                '전체 삭제 확인',
+                f'크래시 이력 전체 {len(self._indexed)}건을 삭제할까요?\n이 작업은 되돌릴 수 없습니다.'):
+            return
+        evs = list(self._indexed)
+        self._indexed.clear()
+        if self._on_delete_crash:
+            self._on_delete_crash(evs)
+        self._rebuild_cards()
+        self._update_count()
+        self._clear_detail()
+
+    def _clear_detail(self):
+        self._selected = None
+        self._lbl_app.config(text='항목을 선택하세요')
+        self._lbl_type.config(text='')
+        self._lbl_sum.config(text='')
+        for txt in (self._analysis_txt, self._raw_txt, self._report_txt):
+            txt.config(state=tk.NORMAL)
+            txt.delete('1.0', tk.END)
+            txt.config(state=tk.DISABLED)
 
     def _on_mousewheel(self, e):
         delta = -1 * (e.delta // 120)
@@ -1554,7 +1641,9 @@ class QAMonitor:
             crash_snap   = list(self._history)
             install_snap = list(self._install_history)
             window = HistoryWindow(crash_snap, install_snap,
-                                   on_open=self._on_window_open)
+                                   on_open=self._on_window_open,
+                                   on_delete_crash=self._on_delete_crash,
+                                   on_delete_install=self._on_delete_install)
             self._open_window = window
 
         def run_window():
@@ -1571,6 +1660,20 @@ class QAMonitor:
         if self._icon:
             self._icon.icon  = self._make_tray_icon(alert=False)
             self._icon.title = self._idle_title()
+
+    def _on_delete_crash(self, evs: List[CrashEvent]):
+        ids = {id(e) for e in evs}
+        with self._lock:
+            self._history = [e for e in self._history if id(e) not in ids]
+            snapshot = list(self._history)
+        save_history(snapshot)
+
+    def _on_delete_install(self, evs: List[InstallEvent]):
+        ids = {id(e) for e in evs}
+        with self._lock:
+            self._install_history = [e for e in self._install_history if id(e) not in ids]
+            snapshot = list(self._install_history)
+        save_install_history(snapshot)
 
     def _quit(self, icon=None, item=None):
         self._watcher.stop()
