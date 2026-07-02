@@ -15,7 +15,7 @@ import threading
 import subprocess
 import tkinter as tk
 from tkinter import ttk, scrolledtext, messagebox, filedialog
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass, asdict
 from typing import Optional, List, Callable
 from pathlib import Path
@@ -527,8 +527,9 @@ class EventLogWatcher:
             1000: ['앱 이름', '버전', '타임스탬프', '모듈 이름', '모듈 버전',
                    '모듈 타임스탬프', '예외 코드', '오프셋', '프로세스 ID',
                    '시작 시간', '앱 경로', '모듈 경로', 'Report ID'],
-            1002: ['앱 이름', '버전', '타임스탬프', '대기 시간(초)',
-                   '앱 경로', 'Report ID'],
+            1002: ['앱 이름', '버전', '프로세스 ID', '시작 시간', '종료 유형',
+                   '앱 경로', 'Report ID', '패키지 이름', '패키지 앱 ID',
+                   'Hang 유형'],
             7031: ['서비스 이름', '종료 횟수', '복구 동작'],
             7034: ['서비스 이름', '종료 횟수'],
             7000: ['서비스 이름', '오류 내용'],
@@ -544,8 +545,22 @@ class EventLogWatcher:
             if not val:
                 continue
             label = keys[i] if i < len(keys) else f'파라미터[{i}]'
+            if label == '시작 시간':
+                val = EventLogWatcher._filetime_str(val)
             lines.append(f'{label:<18}: {val}')
         return '\n'.join(lines) if lines else '(파라미터 없음)'
+
+    @staticmethod
+    def _filetime_str(val: str) -> str:
+        # 이벤트 로그의 프로세스 시작 시간은 FILETIME(1601-01-01 기준
+        # 100ns 단위, UTC) 16진수 문자열로 들어온다.
+        try:
+            ft = int(str(val).strip(), 16)
+            dt = (datetime(1601, 1, 1, tzinfo=timezone.utc)
+                  + timedelta(microseconds=ft // 10)).astimezone()
+            return f'{val} ({dt.strftime("%Y-%m-%d %H:%M:%S")})'
+        except (ValueError, OverflowError):
+            return val
 
     @staticmethod
     def _build_detail(log_name, eid, source, ts, msg, inserts, from_inserts) -> str:
@@ -639,9 +654,9 @@ class EventLogWatcher:
                           f'충돌 모듈: {module}  |  {exc_label}', detail)
 
     def _hang(self, ts, msg, detail, inserts) -> Optional[CrashEvent]:
-        # inserts[0]=앱명, [4]=대기 시간(초), [5]=앱 경로
+        # inserts[0]=앱명, [9]=Hang 유형 (이벤트 1002에는 대기 시간 파라미터가 없음)
         proc      = self._ins(inserts, 0)
-        wait_sec  = self._ins(inserts, 4)
+        hang_type = self._ins(inserts, 9)
 
         if not proc:
             # 메시지 텍스트에서 추출
@@ -653,10 +668,11 @@ class EventLogWatcher:
                             proc = words[i + 1]; break
                     break
 
-        wait_label = f'{wait_sec}초 동안 응답 없음' if wait_sec else 'UI 스레드 응답 없음'
+        summary = 'UI 스레드 응답 없음 — Windows에 의해 강제 종료됨'
+        if hang_type:
+            summary += f'  |  Hang 유형: {hang_type}'
         return CrashEvent(ts, self._resolve(proc), proc,
-                          '응답 없음 (Hang)',
-                          f'{wait_label} — Windows에 의해 강제 종료됨', detail)
+                          '응답 없음 (Hang)', summary, detail)
 
     def _service(self, ts, msg, detail, inserts) -> Optional[CrashEvent]:
         # inserts[0]=서비스 이름, [1]=종료 횟수
