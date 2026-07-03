@@ -9,7 +9,6 @@ import sys
 import csv
 import gc
 import json
-import time
 import queue
 import threading
 import subprocess
@@ -63,6 +62,10 @@ DUMP_DIR          = Path(os.environ.get('ProgramData', r'C:\ProgramData')) / 'ez
 DUMP_ANALYZER_EXE = BASE_DIR / 'DumpAnalyzer.exe'
 MAX_DUMP_FILES    = 20  # 오래된 덤프는 자동 삭제, 최근 N개만 보관
 
+# 이미 분석한 덤프 파일명 목록. 영속시키지 않으면 재시작할 때마다 남아있는
+# 덤프 전부를 다시 분석한다 (개당 최대 90초 — 시작 직후 CPU 낭비).
+ANALYZED_DUMPS_FILE = DATA_DIR / 'analyzed_dumps.json'
+
 APP_AUMID    = 'EzLab.QAMonitor'
 APP_NAME     = 'ezLab QA Monitor'
 
@@ -76,6 +79,18 @@ def _read_version() -> str:
 
 
 APP_VERSION = _read_version()
+
+
+def _enable_dpi_awareness():
+    """고DPI 배율(125%/150%)에서 Windows가 창을 비트맵 확대하지 않게 한다.
+    이게 없으면 글자가 뿌옇게 번져서 오래된 프로그램처럼 보인다."""
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)   # SYSTEM_DPI_AWARE
+    except Exception:
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()
+        except Exception:
+            pass
 
 
 def _register_aumid():
@@ -194,6 +209,7 @@ SURFACE = '#FFFFFF'   # 표면
 PANEL   = '#FFFFFF'   # 패널
 CARD    = '#FFFFFF'   # 카드
 OVERLAY = '#EBF4FF'   # 선택 (연파랑)
+HOVER   = '#F7FAFC'   # 카드 호버
 BORDER  = '#E2E8F0'   # 구분선
 
 FG      = '#1A202C'   # 기본 텍스트
@@ -209,8 +225,11 @@ TEAL    = '#2C7A7B'   # 서비스
 MAUVE   = '#553C9A'   # 강조
 CYAN    = '#2A4365'   # 스택 트레이스
 
-RED_BG  = '#FFF5F5'   # 크래시 카드 배경 틴트
-BLUE_BG = '#EBF8FF'   # 서비스 카드 배경 틴트
+RED_BG   = '#FFF5F5'  # 크래시 카드 배경 틴트
+BLUE_BG  = '#EBF8FF'  # 서비스 카드 배경 틴트
+GREEN_BG = '#F0FFF4'  # '감시 중' 상태 배지 배경
+
+SEARCH_PLACEHOLDER = '검색 (앱 · 요약 · 로그 내용)'
 
 
 # ── 데이터 모델 & 영속성 ──────────────────────────────────────────
@@ -291,12 +310,6 @@ def save_history(history: List[CrashEvent]) -> None:
         pass
 
 
-def append_to_history(ev: CrashEvent) -> None:
-    history = load_history()
-    history.append(ev)
-    save_history(history)
-
-
 def load_install_history() -> List[InstallEvent]:
     if not INSTALL_HISTORY_FILE.exists():
         return []
@@ -314,12 +327,6 @@ def save_install_history(history: List[InstallEvent]) -> None:
         _atomic_write_json(INSTALL_HISTORY_FILE, [_install_to_dict(e) for e in history])
     except Exception:
         pass
-
-
-def append_install_history(ev: InstallEvent) -> None:
-    history = load_install_history()
-    history.append(ev)
-    save_install_history(history)
 
 
 # ── 이벤트 로그 감시 ─────────────────────────────────────────────
@@ -363,9 +370,8 @@ class EventLogWatcher:
 
     def _loop(self):
         while not self._stop.wait(POLL_SECONDS):
-            ok = True
             try:
-                self._poll()
+                ok = self._poll()
             except Exception:
                 ok = False
             if self._on_poll:
@@ -374,8 +380,11 @@ class EventLogWatcher:
                 except Exception:
                     pass
 
-    def _poll(self):
+    def _poll(self) -> bool:
+        """모든 채널을 정상 처리했으면 True. 채널별 예외를 여기서 삼키더라도
+        실패 여부는 반환해야 _on_poll의 '감시 멈춤' 경고가 실제로 동작한다."""
         state_before = dict(self._last_record)
+        failed = 0
         for log_name in EVENT_LOGS:
             # 이 채널의 첫 폴이면서 이전 실행의 저장 상태가 있으면, 지금
             # 따라잡는 이벤트들은 "모니터 미실행 중 발생분"(백필)이다.
@@ -425,11 +434,16 @@ class EventLogWatcher:
                 self._last_record[log_name] = new_max
                 win32evtlog.CloseEventLog(handle)
 
-                # 오래된 것부터 순서대로 처리
+                # 오래된 것부터 순서대로 처리. 레코드 번호는 이미 위에서
+                # 전진시켰으므로, 이벤트 1건이 예외를 내도 같은 배치의
+                # 나머지가 통째로 유실되지 않게 건별로 격리한다.
                 processed = 0
                 for ev in reversed(to_process):
-                    if self._process(log_name, ev):
-                        processed += 1
+                    try:
+                        if self._process(log_name, ev):
+                            processed += 1
+                    except Exception:
+                        pass
 
                 # 백필 완료 처리: 두 채널 모두 끝나면 합계를 한 번만 통지
                 if log_name in self._backfill_pending:
@@ -442,10 +456,11 @@ class EventLogWatcher:
                             pass
 
             except Exception:
-                pass
+                failed += 1
         self._in_backfill = False
         if self._last_record != state_before:
             self._save_state()
+        return failed == 0
 
     def _process(self, log_name: str, ev) -> bool:
         """이지랩 관련 이벤트를 실제로 발행했으면 True (백필 집계용)."""
@@ -559,7 +574,9 @@ class EventLogWatcher:
             dt = (datetime(1601, 1, 1, tzinfo=timezone.utc)
                   + timedelta(microseconds=ft // 10)).astimezone()
             return f'{val} ({dt.strftime("%Y-%m-%d %H:%M:%S")})'
-        except (ValueError, OverflowError):
+        except Exception:
+            # 값이 손상됐거나 OS 시간 범위를 벗어나면(astimezone은 OSError를
+            # 던질 수 있음) 원본 그대로 표시한다
             return val
 
     @staticmethod
@@ -729,8 +746,22 @@ class DumpWatcher:
 
     def __init__(self, on_stack_trace: Callable[[str, datetime, str], None]):
         self._on_stack_trace = on_stack_trace
-        self._seen: set = set()
+        self._seen: set = self._load_seen()
         self._stop = threading.Event()
+
+    @staticmethod
+    def _load_seen() -> set:
+        try:
+            with open(ANALYZED_DUMPS_FILE, 'r', encoding='utf-8') as f:
+                return set(json.load(f))
+        except Exception:
+            return set()
+
+    def _save_seen(self):
+        try:
+            _atomic_write_json(ANALYZED_DUMPS_FILE, sorted(self._seen))
+        except Exception:
+            pass
 
     def start(self):
         threading.Thread(target=self._loop, daemon=True, name='DumpWatcher').start()
@@ -750,10 +781,12 @@ class DumpWatcher:
             return
         dumps = sorted(DUMP_DIR.glob('*.dmp'), key=lambda p: p.stat().st_mtime)
 
+        changed = False
         for dmp in dumps:
             if dmp.name in self._seen:
                 continue
             self._seen.add(dmp.name)
+            changed = True
             self._analyze(dmp)
 
         # 보관 개수 제한: 오래된 것부터 정리
@@ -763,6 +796,15 @@ class DumpWatcher:
                 old.unlink()
             except Exception:
                 pass
+
+        # 삭제된 덤프의 이름은 상태에서도 정리해 파일이 무한히 크지 않게 한다
+        existing = {p.name for p in DUMP_DIR.glob('*.dmp')}
+        pruned = self._seen & existing
+        if pruned != self._seen:
+            self._seen = pruned
+            changed = True
+        if changed:
+            self._save_seen()
 
     def _analyze(self, dmp_path: Path):
         if not DUMP_ANALYZER_EXE.exists():
@@ -811,6 +853,8 @@ class HistoryWindow:
         self._on_delete_crash   = on_delete_crash
         self._on_delete_install = on_delete_install
         self._selected: Optional[CrashEvent] = None
+        self._selected_idx: Optional[int] = None
+        self._filter_job = None   # 검색 입력 디바운스용 after() 핸들
         self._card_frames: List[tk.Frame] = []
         self._card_tints:  List[str] = []
         self._card_bars:   List[tk.Frame] = []
@@ -833,6 +877,11 @@ class HistoryWindow:
         """스레드 안전: Tk를 건드리지 않고 큐에만 적재."""
         if not self._closed:
             self._push_q.put(('install', ev))
+
+    def bring_to_front(self):
+        """스레드 안전: 이미 열려 있는 창을 앞으로 가져온다 (트레이 재클릭)."""
+        if not self._closed:
+            self._push_q.put(('focus', None))
 
     def _on_new_event(self, ev: CrashEvent):
         self._master.insert(0, ev)
@@ -887,7 +936,7 @@ class HistoryWindow:
 
             hdr_btn = tk.Button(
                 grp, text=f'▾  {label}',
-                font=('Segoe UI', 8, 'bold'),
+                font=('Segoe UI', 9, 'bold'),
                 bg=BG, fg=SUBTLE,
                 relief=tk.FLAT, bd=0, anchor=tk.W,
                 padx=16, pady=9, cursor='hand2',
@@ -924,9 +973,23 @@ class HistoryWindow:
         root = tk.Tk()
         self._root = root
         root.title('ezLab QA Monitor')
-        root.geometry('1320x780')
+        # DPI 인식 상태에서는 픽셀 크기가 배율만큼 작아 보이므로 창 크기를
+        # 실제 DPI에 맞춰 잡는다 (폰트는 pt 단위라 자동으로 커짐)
+        try:
+            dpi_scale = root.winfo_fpixels('1i') / 96.0
+        except Exception:
+            dpi_scale = 1.0
+        root.geometry(f'{int(1320 * dpi_scale)}x{int(780 * dpi_scale)}')
         root.configure(bg=BG)
-        root.minsize(900, 560)
+        root.minsize(int(900 * dpi_scale), int(560 * dpi_scale))
+
+        # 콤보박스 드롭다운 목록 색상 (전역 옵션으로만 지정 가능)
+        root.option_add('*TCombobox*Listbox.background', SURFACE)
+        root.option_add('*TCombobox*Listbox.foreground', FG)
+        root.option_add('*TCombobox*Listbox.selectBackground', OVERLAY)
+        root.option_add('*TCombobox*Listbox.selectForeground', FG)
+        root.option_add('*TCombobox*Listbox.font', ('Segoe UI', 9))
+        root.option_add('*TCombobox*Listbox.borderWidth', 0)
 
         if LOGO_ICO.exists():
             root.iconbitmap(str(LOGO_ICO))
@@ -951,8 +1014,16 @@ class HistoryWindow:
                     kind, ev = self._push_q.get_nowait()
                     if kind == 'crash':
                         self._on_new_event(ev)
-                    else:
+                    elif kind == 'install':
                         self._on_new_install(ev)
+                    elif kind == 'focus':
+                        root.deiconify()
+                        root.lift()
+                        root.focus_force()
+                        # 다른 창에 가려져 있으면 lift만으로는 안 올라오는
+                        # 경우가 있어 topmost를 잠깐 켰다 끈다
+                        root.attributes('-topmost', True)
+                        root.after(150, lambda: root.attributes('-topmost', False))
             except queue.Empty:
                 pass
             if not self._closed:
@@ -985,37 +1056,49 @@ class HistoryWindow:
                 self.__dict__[k] = None
         gc.collect()
 
-    # ── 상단 탭 스위처 ──
+    # ── 상단 탭 스위처 (밑줄 인디케이터 스타일) ──
     def _build_tab_switcher(self, parent: tk.Tk):
-        bar = tk.Frame(parent, bg=SURFACE, height=36)
+        bar = tk.Frame(parent, bg=SURFACE)
         bar.pack(fill=tk.X)
-        bar.pack_propagate(False)
 
         self._tab_btns = {}
+        self._active_tab = 'crash'
 
         def switch(name):
+            self._active_tab = name
             if name == 'crash':
                 self._crash_frame.pack(fill=tk.BOTH, expand=True)
                 self._install_view.pack_forget()
             else:
                 self._install_view.pack(fill=tk.BOTH, expand=True)
                 self._crash_frame.pack_forget()
-            for n, b in self._tab_btns.items():
-                b.config(bg=SURFACE if n == name else BG,
-                         fg=BLUE if n == name else MUTED,
-                         font=('Segoe UI', 9, 'bold' if n == name else 'normal'))
+            for n, (lbl, ind) in self._tab_btns.items():
+                active = n == name
+                lbl.config(fg=BLUE if active else MUTED,
+                           font=('Segoe UI', 10, 'bold' if active else 'normal'))
+                ind.config(bg=BLUE if active else SURFACE)
 
-        for key, label in [('crash', '  크래시 이력  '), ('install', '  설치 / 삭제 이력  ')]:
-            btn = tk.Button(bar, text=label,
-                            font=('Segoe UI', 9, 'bold' if key == 'crash' else 'normal'),
-                            bg=SURFACE if key == 'crash' else BG,
-                            fg=BLUE if key == 'crash' else MUTED,
-                            relief=tk.FLAT, bd=0, padx=8,
-                            activebackground=SURFACE, activeforeground=BLUE,
-                            cursor='hand2',
-                            command=lambda k=key: switch(k))
-            btn.pack(side=tk.LEFT, fill=tk.Y)
-            self._tab_btns[key] = btn
+        for key, label in [('crash', '크래시 이력'), ('install', '설치 / 삭제 이력')]:
+            active = key == 'crash'
+            cell = tk.Frame(bar, bg=SURFACE, cursor='hand2')
+            cell.pack(side=tk.LEFT)
+            lbl = tk.Label(cell, text=label,
+                           font=('Segoe UI', 10, 'bold' if active else 'normal'),
+                           bg=SURFACE, fg=BLUE if active else MUTED,
+                           padx=18, pady=9)
+            lbl.pack()
+            ind = tk.Frame(cell, bg=BLUE if active else SURFACE, height=2)
+            ind.pack(fill=tk.X)
+
+            def _hover(on, k=key, l=lbl):
+                if k != self._active_tab:
+                    l.config(fg=SUBTLE if on else MUTED)
+
+            for w in (cell, lbl):
+                w.bind('<Button-1>', lambda e, k=key: switch(k))
+                w.bind('<Enter>', lambda e, h=_hover: h(True))
+                w.bind('<Leave>', lambda e, h=_hover: h(False))
+            self._tab_btns[key] = (lbl, ind)
 
         tk.Frame(parent, bg=BORDER, height=1).pack(fill=tk.X)
 
@@ -1027,13 +1110,13 @@ class HistoryWindow:
         tk.Label(hdr, text='앱별 설치 / 삭제 이력',
                  font=('Segoe UI', 10, 'bold'), bg=SURFACE, fg=FG).pack(side=tk.LEFT)
         tk.Label(hdr, text='MobSoft 제품만 표시됩니다',
-                 font=('Segoe UI', 8), bg=SURFACE, fg=MUTED).pack(side=tk.LEFT, padx=12)
-        clear_all_lbl = tk.Label(hdr, text='전체 삭제', font=('Segoe UI', 8),
+                 font=('Segoe UI', 9), bg=SURFACE, fg=MUTED).pack(side=tk.LEFT, padx=12)
+        clear_all_lbl = tk.Label(hdr, text='전체 삭제', font=('Segoe UI', 9),
                                   bg=SURFACE, fg=RED, cursor='hand2')
         clear_all_lbl.pack(side=tk.RIGHT)
         clear_all_lbl.bind('<Button-1>', lambda e: self._clear_all_install())
 
-        csv_lbl = tk.Label(hdr, text='CSV 내보내기', font=('Segoe UI', 8),
+        csv_lbl = tk.Label(hdr, text='CSV 내보내기', font=('Segoe UI', 9),
                             bg=SURFACE, fg=BLUE, cursor='hand2')
         csv_lbl.pack(side=tk.RIGHT, padx=(0, 12))
         csv_lbl.bind('<Button-1>', lambda e: self._export_install_csv())
@@ -1114,12 +1197,12 @@ class HistoryWindow:
                      ).pack(side=tk.LEFT)
 
             tk.Label(hdr, text=f'{len(events)}건',
-                     font=('Segoe UI', 8), bg=PANEL, fg=MUTED
+                     font=('Segoe UI', 9), bg=PANEL, fg=MUTED
                      ).pack(side=tk.LEFT, padx=8)
 
             latest_color = GREEN if latest.action == '설치' else YELLOW if latest.action == '업데이트' else RED
             tk.Label(hdr, text=f'최근: {latest.action} · {latest.version}',
-                     font=('Segoe UI', 8), bg=PANEL, fg=latest_color
+                     font=('Segoe UI', 9), bg=PANEL, fg=latest_color
                      ).pack(side=tk.RIGHT, padx=14)
 
             for w in (hdr, toggle_btn):
@@ -1137,7 +1220,7 @@ class HistoryWindow:
                 # 액션 뱃지
                 tk.Label(row,
                          text=f'  {ev.action}  ',
-                         font=('Segoe UI', 8, 'bold'),
+                         font=('Segoe UI', 9, 'bold'),
                          bg=action_color, fg=SURFACE,
                          padx=2
                          ).pack(side=tk.LEFT, padx=(14, 10), pady=8)
@@ -1213,53 +1296,67 @@ class HistoryWindow:
         s.map('Vertical.TScrollbar',
               background=[('active', BLUE), ('pressed', BLUE)])
         s.configure('QA.TSeparator', background=BORDER)
+        # 콤보박스: clam 기본(회색 음영, 구식 느낌) 대신 플랫 화이트
+        s.configure('TCombobox',
+                    fieldbackground=SURFACE, background=SURFACE,
+                    foreground=FG, arrowcolor=SUBTLE,
+                    bordercolor=BORDER, lightcolor=SURFACE, darkcolor=SURFACE,
+                    padding=(8, 4))
+        s.map('TCombobox',
+              fieldbackground=[('readonly', SURFACE)],
+              foreground=[('readonly', FG)],
+              selectbackground=[('readonly', SURFACE)],
+              selectforeground=[('readonly', FG)],
+              bordercolor=[('focus', BLUE)],
+              arrowcolor=[('active', BLUE)])
 
     # ── 헤더 ──
     def _build_header(self, parent: tk.Tk):
-        hdr = tk.Frame(parent, bg=SURFACE, height=60)
+        hdr = tk.Frame(parent, bg=SURFACE, height=64)
         hdr.pack(fill=tk.X)
         hdr.pack_propagate(False)
 
         # 로고
         if LOGO_PNG.exists():
             try:
-                logo = Image.open(LOGO_PNG).convert('RGBA').resize((30, 30), Image.LANCZOS)
+                logo = Image.open(LOGO_PNG).convert('RGBA').resize((32, 32), Image.LANCZOS)
                 self._logo_photo = ImageTk.PhotoImage(logo)
                 tk.Label(hdr, image=self._logo_photo, bg=SURFACE).pack(
-                    side=tk.LEFT, padx=(20, 8), pady=15)
+                    side=tk.LEFT, padx=(20, 10), pady=16)
             except Exception:
                 pass
 
         title_frame = tk.Frame(hdr, bg=SURFACE)
-        title_frame.pack(side=tk.LEFT, pady=15)
+        title_frame.pack(side=tk.LEFT, pady=16)
         title_row = tk.Frame(title_frame, bg=SURFACE)
         title_row.pack(anchor=tk.W)
         tk.Label(title_row, text='ezLab QA Monitor',
-                 font=('Segoe UI', 13, 'bold'), bg=SURFACE, fg=FG
+                 font=('Segoe UI', 14, 'bold'), bg=SURFACE, fg=FG
                  ).pack(side=tk.LEFT)
         tk.Label(title_row, text=f'v{APP_VERSION}',
-                 font=('Segoe UI', 8), bg=SURFACE, fg=MUTED
-                 ).pack(side=tk.LEFT, padx=(6, 0), pady=(5, 0))
+                 font=('Segoe UI', 9), bg=SURFACE, fg=MUTED
+                 ).pack(side=tk.LEFT, padx=(8, 0), pady=(6, 0))
 
         # 오른쪽 상태
         right = tk.Frame(hdr, bg=SURFACE)
-        right.pack(side=tk.RIGHT, padx=20, pady=15)
+        right.pack(side=tk.RIGHT, padx=20, pady=16)
 
         n = len(self._history)
         self._count_var = tk.StringVar(value=f'  {n}건  ')
         self._count_label = tk.Label(right, textvariable=self._count_var,
-                                     font=('Segoe UI', 8, 'bold'),
-                                     bg=RED, fg='#FFFFFF', padx=4, pady=2)
+                                     font=('Segoe UI', 9, 'bold'),
+                                     bg=RED, fg='#FFFFFF', padx=6, pady=3)
         if n > 0:
             self._count_label.pack(side=tk.RIGHT, padx=(10, 0))
 
-        status_frame = tk.Frame(right, bg=SURFACE)
+        # '감시 중' 상태 배지 (연녹색 칩)
+        status_frame = tk.Frame(right, bg=GREEN_BG, padx=10, pady=4)
         status_frame.pack(side=tk.RIGHT)
-        dot_canvas = tk.Canvas(status_frame, width=8, height=8, bg=SURFACE, highlightthickness=0)
-        dot_canvas.pack(side=tk.LEFT, padx=(0, 4))
+        dot_canvas = tk.Canvas(status_frame, width=8, height=8, bg=GREEN_BG, highlightthickness=0)
+        dot_canvas.pack(side=tk.LEFT, padx=(0, 5))
         dot_canvas.create_oval(1, 1, 7, 7, fill=GREEN, outline='')
         tk.Label(status_frame, text='감시 중',
-                 font=('Segoe UI', 9, 'bold'), bg=SURFACE, fg=GREEN
+                 font=('Segoe UI', 9, 'bold'), bg=GREEN_BG, fg=GREEN
                  ).pack(side=tk.LEFT)
 
         # 구분선
@@ -1283,27 +1380,68 @@ class HistoryWindow:
                  font=('Segoe UI', 9, 'bold'), bg=BG, fg=SUBTLE
                  ).pack(side=tk.LEFT)
 
-        clear_all_lbl = tk.Label(lhdr, text='전체 삭제', font=('Segoe UI', 8),
+        clear_all_lbl = tk.Label(lhdr, text='전체 삭제', font=('Segoe UI', 9),
                                   bg=BG, fg=RED, cursor='hand2')
         clear_all_lbl.pack(side=tk.RIGHT)
         clear_all_lbl.bind('<Button-1>', lambda e: self._clear_all_crash())
 
-        csv_lbl = tk.Label(lhdr, text='CSV 내보내기', font=('Segoe UI', 8),
+        csv_lbl = tk.Label(lhdr, text='CSV 내보내기', font=('Segoe UI', 9),
                             bg=BG, fg=BLUE, cursor='hand2')
         csv_lbl.pack(side=tk.RIGHT, padx=(0, 12))
         csv_lbl.bind('<Button-1>', lambda e: self._export_crash_csv())
 
-        # 필터 (앱 / 오류 유형)
+        # 필터 (앱 / 오류 유형 / 기간)
         fbar = tk.Frame(left, bg=BG)
-        fbar.pack(fill=tk.X, padx=16, pady=(0, 10))
+        fbar.pack(fill=tk.X, padx=16, pady=(0, 6))
         self._filter_app  = ttk.Combobox(fbar, state='readonly', width=13,
-                                          font=('Segoe UI', 8))
+                                          font=('Segoe UI', 9))
         self._filter_type = ttk.Combobox(fbar, state='readonly', width=16,
-                                          font=('Segoe UI', 8))
+                                          font=('Segoe UI', 9))
         self._filter_app.pack(side=tk.LEFT)
         self._filter_type.pack(side=tk.LEFT, padx=(6, 0))
         self._filter_app.bind('<<ComboboxSelected>>', self._apply_filter)
         self._filter_type.bind('<<ComboboxSelected>>', self._apply_filter)
+
+        # 검색 + 기간
+        fbar2 = tk.Frame(left, bg=BG)
+        fbar2.pack(fill=tk.X, padx=16, pady=(0, 10))
+
+        self._filter_period = ttk.Combobox(
+            fbar2, state='readonly', width=9, font=('Segoe UI', 9),
+            values=['전체 기간', '오늘', '최근 7일', '최근 30일'])
+        self._filter_period.set('전체 기간')
+        self._filter_period.pack(side=tk.RIGHT, padx=(6, 0))
+        self._filter_period.bind('<<ComboboxSelected>>', self._apply_filter)
+
+        self._search_var   = tk.StringVar()
+        self._search_is_ph = False
+        ent = tk.Entry(fbar2, textvariable=self._search_var,
+                       font=('Segoe UI', 9), bg=SURFACE, fg=FG,
+                       relief=tk.FLAT, insertbackground=FG,
+                       highlightthickness=1, highlightbackground=BORDER,
+                       highlightcolor=BLUE)
+        ent.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=2)
+        self._search_entry = ent
+
+        def _ph_show():
+            self._search_is_ph = True
+            self._search_var.set(SEARCH_PLACEHOLDER)
+            ent.config(fg=MUTED)
+
+        def _ph_focus_in(_e):
+            if self._search_is_ph:
+                self._search_is_ph = False
+                self._search_var.set('')
+                ent.config(fg=FG)
+
+        def _ph_focus_out(_e):
+            if not self._search_var.get().strip():
+                _ph_show()
+
+        ent.bind('<FocusIn>',  _ph_focus_in)
+        ent.bind('<FocusOut>', _ph_focus_out)
+        ent.bind('<KeyRelease>', self._schedule_filter)
+        _ph_show()
 
         tk.Frame(left, bg=BORDER, height=1).pack(fill=tk.X)
 
@@ -1336,15 +1474,15 @@ class HistoryWindow:
         self._detail_hdr.pack(fill=tk.X)
 
         self._lbl_app   = tk.Label(self._detail_hdr, text='항목을 선택하세요',
-                                    font=('Segoe UI', 14, 'bold'), bg=SURFACE, fg=FG, anchor=tk.W)
+                                    font=('Segoe UI', 15, 'bold'), bg=SURFACE, fg=FG, anchor=tk.W)
         self._lbl_app.pack(fill=tk.X)
 
         self._lbl_type  = tk.Label(self._detail_hdr, text='',
-                                    font=('Segoe UI', 9), bg=SURFACE, fg=MUTED, anchor=tk.W)
+                                    font=('Segoe UI', 10), bg=SURFACE, fg=MUTED, anchor=tk.W)
         self._lbl_type.pack(fill=tk.X, pady=(3, 0))
 
         self._lbl_sum   = tk.Label(self._detail_hdr, text='',
-                                    font=('Segoe UI', 9), bg=SURFACE, fg=SUBTLE, anchor=tk.W,
+                                    font=('Segoe UI', 10), bg=SURFACE, fg=SUBTLE, anchor=tk.W,
                                     wraplength=700, justify=tk.LEFT)
         self._lbl_sum.pack(fill=tk.X, pady=(6, 0))
 
@@ -1379,7 +1517,7 @@ class HistoryWindow:
                 active = n == name
                 b.config(bg=BLUE if active else BG,
                          fg='#FFFFFF' if active else MUTED,
-                         font=('Segoe UI', 9, 'bold') if active else ('Segoe UI', 9))
+                         font=('Segoe UI', 10, 'bold') if active else ('Segoe UI', 10))
 
         self._switch_detail = _switch_detail
 
@@ -1388,10 +1526,10 @@ class HistoryWindow:
                                    ('report',   '◈',  '보고서')]:
             active = key == 'analysis'
             btn = tk.Button(tab_bar, text=f'{icon}  {label}',
-                            font=('Segoe UI', 9, 'bold' if active else 'normal'),
+                            font=('Segoe UI', 10, 'bold' if active else 'normal'),
                             bg=BLUE if active else BG,
                             fg='#FFFFFF' if active else MUTED,
-                            relief=tk.FLAT, bd=0, padx=14, pady=6,
+                            relief=tk.FLAT, bd=0, padx=16, pady=7,
                             cursor='hand2',
                             command=lambda k=key: _switch_detail(k))
             btn.pack(side=tk.LEFT, padx=(0, 6))
@@ -1447,17 +1585,17 @@ class HistoryWindow:
         self._copy_btn = tk.Button(
             btn_frame,
             text='📋  개발자 보고서 복사',
-            font=('Segoe UI', 9, 'bold'),
+            font=('Segoe UI', 10, 'bold'),
             bg=BLUE, fg='#FFFFFF',
-            relief=tk.FLAT, padx=16, pady=6,
+            relief=tk.FLAT, padx=18, pady=7,
             cursor='hand2', activebackground=MAUVE, activeforeground='#FFFFFF',
         )
         self._copy_btn.pack(side=tk.LEFT)
         tk.Label(btn_frame, text='클립보드에 복사되면 바로 붙여넣기 가능합니다',
-                 font=('Segoe UI', 8), bg=PANEL, fg=MUTED).pack(side=tk.LEFT, padx=10)
+                 font=('Segoe UI', 9), bg=SURFACE, fg=MUTED).pack(side=tk.LEFT, padx=10)
 
         tk.Frame(parent, bg=BORDER, height=1).pack(fill=tk.X)
-        self._report_txt = self._make_text(parent, font=('Consolas', 8), fg=SUBTLE)
+        self._report_txt = self._make_text(parent, font=('Consolas', 9), fg=SUBTLE)
 
     def _add_card(self, parent: tk.Frame, ev: CrashEvent, idx: int):
         is_svc   = '서비스' in ev.error_type
@@ -1477,39 +1615,44 @@ class HistoryWindow:
         bar.pack(side=tk.LEFT, fill=tk.Y)
         self._card_bars.append(bar)
 
-        inner = tk.Frame(card, bg=card_tint, padx=14, pady=11)
+        inner = tk.Frame(card, bg=card_tint, padx=16, pady=12)
         inner.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
         # 앱 이름 + 시간
         top = tk.Frame(inner, bg=card_tint)
         top.pack(fill=tk.X)
         tk.Label(top, text=ev.app_name,
-                 font=('Segoe UI', 9, 'bold'), bg=card_tint, fg=FG, anchor=tk.W
+                 font=('Segoe UI', 10, 'bold'), bg=card_tint, fg=FG, anchor=tk.W
                  ).pack(side=tk.LEFT)
         tk.Label(top, text=ev.timestamp.strftime('%m-%d  %H:%M'),
-                 font=('Segoe UI', 8), bg=card_tint, fg=MUTED, anchor=tk.E
+                 font=('Segoe UI', 9), bg=card_tint, fg=MUTED, anchor=tk.E
                  ).pack(side=tk.RIGHT)
 
         # 유형 배지
         badge_frame = tk.Frame(inner, bg=card_tint)
         badge_frame.pack(fill=tk.X, pady=(4, 0))
         tk.Label(badge_frame, text=ev.error_type,
-                 font=('Segoe UI', 8, 'bold'), bg=card_tint, fg=type_color, anchor=tk.W
+                 font=('Segoe UI', 9, 'bold'), bg=card_tint, fg=type_color, anchor=tk.W
                  ).pack(side=tk.LEFT)
 
         # 요약 (1줄)
         summary_short = ev.summary[:58] + '…' if len(ev.summary) > 58 else ev.summary
         tk.Label(inner, text=summary_short,
-                 font=('Segoe UI', 8), bg=card_tint, fg=SUBTLE, anchor=tk.W,
-                 wraplength=290, justify=tk.LEFT
-                 ).pack(fill=tk.X, pady=(2, 0))
+                 font=('Segoe UI', 9), bg=card_tint, fg=SUBTLE, anchor=tk.W,
+                 wraplength=300, justify=tk.LEFT
+                 ).pack(fill=tk.X, pady=(3, 0))
 
-        # 클릭 이벤트
+        # 클릭/호버 이벤트 — 선택된 카드는 호버로 하이라이트를 덮지 않는다
+        def _hover(on, i=idx, c=card, b=bar, t=card_tint):
+            if i == self._selected_idx:
+                return
+            self._set_bg(c, HOVER if on else t, {b})
+
         all_widgets = [card, inner, top, badge_frame] + list(inner.winfo_children()) + list(top.winfo_children())
         for w in all_widgets:
             w.bind('<Button-1>', lambda e, i=idx: self._select(i))
-            w.bind('<Enter>',   lambda e, c=card, t=card_tint: c.configure(bg=self._hover_bg(c)))
-            w.bind('<Leave>',   lambda e, c=card, t=card_tint: self._restore_bg(c, t))
+            w.bind('<Enter>',   lambda e: _hover(True))
+            w.bind('<Leave>',   lambda e: _hover(False))
             w.bind('<MouseWheel>', self._on_mousewheel)
 
         # 삭제 버튼 (선택 클릭과 겹치지 않도록 위 바인딩 루프 이후 별도 바인딩)
@@ -1531,21 +1674,56 @@ class HistoryWindow:
         self._filter_app.set(cur_a if cur_a in apps else '전체 앱')
         self._filter_type.set(cur_t if cur_t in types else '전체 유형')
 
+    def _schedule_filter(self, event=None):
+        # 키 입력마다 카드 전체를 다시 그리면 목록이 클 때 버벅이므로 디바운스
+        if self._root is None:
+            return
+        if self._filter_job is not None:
+            try:
+                self._root.after_cancel(self._filter_job)
+            except Exception:
+                pass
+        self._filter_job = self._root.after(250, self._apply_filter)
+
     def _apply_filter(self, event=None):
+        self._filter_job = None
         fa = self._filter_app.get()
         ft = self._filter_type.get()
+        fp = self._filter_period.get()
         evs = self._master
         if fa and fa != '전체 앱':
             evs = [e for e in evs if e.app_name == fa]
         if ft and ft != '전체 유형':
             evs = [e for e in evs if e.error_type == ft]
+
+        if fp and fp != '전체 기간':
+            now = datetime.now()
+            cutoff = {
+                '오늘':     now.replace(hour=0, minute=0, second=0, microsecond=0),
+                '최근 7일':  now - timedelta(days=7),
+                '최근 30일': now - timedelta(days=30),
+            }.get(fp)
+            if cutoff:
+                evs = [e for e in evs if e.timestamp >= cutoff]
+
+        q = '' if self._search_is_ph else self._search_var.get().strip().lower()
+        if q:
+            evs = [e for e in evs
+                   if q in e.app_name.lower() or q in e.process.lower()
+                   or q in e.error_type.lower() or q in e.summary.lower()
+                   or q in e.detail.lower()]
+
         self._indexed = list(evs)
         self._rebuild_cards()
         self._update_count()
-        if self._indexed:
-            self._select(0)
-        else:
+        if not self._indexed:
             self._clear_detail()
+            return
+        # 보고 있던 항목이 여전히 목록에 있으면 선택을 유지한다
+        # (실시간 이벤트가 들어올 때마다 맨 위로 튀지 않도록)
+        keep = next((i for i, e in enumerate(self._indexed)
+                     if e is self._selected), 0)
+        self._select(keep)
 
     def _remove_from_master(self, evs: List[CrashEvent]):
         ids = {id(e) for e in evs}
@@ -1602,6 +1780,7 @@ class HistoryWindow:
 
     def _clear_detail(self):
         self._selected = None
+        self._selected_idx = None
         self._lbl_app.config(text='항목을 선택하세요')
         self._lbl_type.config(text='')
         self._lbl_sum.config(text='')
@@ -1624,12 +1803,6 @@ class HistoryWindow:
                 return
             w = getattr(w, 'master', None)
 
-    def _hover_bg(self, frame: tk.Frame) -> str:
-        return '#F7FAFC'
-
-    def _restore_bg(self, frame: tk.Frame, color: str):
-        frame.configure(bg=color)
-
     @staticmethod
     def _set_bg(widget, bg, skip):
         if widget in skip:
@@ -1642,6 +1815,7 @@ class HistoryWindow:
             HistoryWindow._set_bg(child, bg, skip)
 
     def _select(self, idx: int):
+        self._selected_idx = idx
         for i, cf in enumerate(self._card_frames):
             tint   = self._card_tints[i] if i < len(self._card_tints) else CARD
             sel_bg = OVERLAY if i == idx else tint
@@ -1650,6 +1824,10 @@ class HistoryWindow:
             self._set_bg(cf, sel_bg, skip)
 
         ev = self._indexed[idx]
+        if ev is self._selected:
+            # 같은 항목 재선택(목록 갱신 등): 탭을 다시 채우면 읽던 스크롤
+            # 위치가 초기화되므로 하이라이트만 갱신하고 끝낸다
+            return
         self._selected = ev
 
         # 헤더 업데이트
@@ -1765,7 +1943,18 @@ class HistoryWindow:
         elif ev.error_type == '응답 없음 (Hang)':
             w('원인 분석\n', 'section')
             w('─' * 46 + '\n', 'sep')
-            w('AppHangB1: UI 메인 스레드가 메시지 펌프를 멈췄습니다.\n', 'warn')
+            w('UI 메인 스레드가 메시지 펌프를 멈춰 Windows가 프로세스를 종료했습니다.\n', 'warn')
+            hang_type = ''
+            for line in ev.detail.splitlines():
+                s = line.strip()
+                if s.startswith('Hang 유형') and ':' in s:
+                    hang_type = s.split(':', 1)[1].strip()
+                    break
+            if hang_type:
+                w('\n')
+                w('Hang 유형    ', 'label'); w(f'{hang_type}\n', 'value')
+                if 'idle' in hang_type.lower():
+                    w('             (창은 살아있으나 입력을 처리하지 못하는 상태에서 종료됨)\n', 'label')
             w('\n가능한 원인\n', 'label')
             w('  1. UI 스레드에서 서비스 IPC 응답을 동기 대기\n', 'value')
             w('  2. 내부 Deadlock (Lock 경합)\n', 'value')
@@ -1900,7 +2089,12 @@ class QAMonitor:
             self._history.append(ev)
             count = len(self._history)
             win = self._open_window
-        append_to_history(ev)
+            # 백필 중에는 건마다 디스크에 쓰지 않고(수백 건이면 O(n²) I/O),
+            # _on_backfill_done에서 한 번만 저장한다. watcher_state는 폴이
+            # 끝난 뒤에 저장되므로 중간에 죽어도 다음 시작 때 다시 백필된다.
+            snapshot = None if backfill else list(self._history)
+        if snapshot is not None:
+            save_history(snapshot)
 
         # 백필(미실행 중 발생분)은 이력에만 조용히 추가하고, 토스트/알림은
         # _on_backfill_done에서 합계로 한 번만 띄운다.
@@ -1940,13 +2134,18 @@ class QAMonitor:
         with self._lock:
             self._install_history.append(ev)
             win = self._open_window
-        append_install_history(ev)
+            snapshot = list(self._install_history)
+        save_install_history(snapshot)
         if win:
             win.push_install(ev)
 
     def _on_backfill_done(self, count: int):
         if count <= 0:
             return
+        # 백필 동안 미뤄둔 크래시 이력 저장을 여기서 한 번에 수행
+        with self._lock:
+            snapshot = list(self._history)
+        save_history(snapshot)
         self._alert_showing = True
         if self._icon:
             self._icon.icon  = self._make_tray_icon(alert=True)
@@ -1990,6 +2189,9 @@ class QAMonitor:
     def _show_history(self, icon=None, item=None):
         with self._lock:
             if self._open_window is not None:
+                # 이미 열려 있으면 새 창 대신 기존 창을 앞으로 (큐 적재만 하므로
+                # 락 안에서 불러도 안전)
+                self._open_window.bring_to_front()
                 return
             crash_snap   = list(self._history)
             install_snap = list(self._install_history)
@@ -2063,6 +2265,7 @@ class QAMonitor:
 
 # ── 진입점 ───────────────────────────────────────────────────────
 if __name__ == '__main__':
+    _enable_dpi_awareness()
     _register_aumid()
 
     MUTEX_NAME = 'Global\\ezLabQAMonitor_SingleInstance'
