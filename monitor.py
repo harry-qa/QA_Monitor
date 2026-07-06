@@ -155,6 +155,10 @@ INSTALL_EVENT_IDS = {
     1035: '업데이트',
 }
 
+# MSI 메이저 업그레이드는 제거(1034)→설치(1033)를 한 트랜잭션에서 연달아 기록한다.
+# 이 간격 안의 삭제→설치만 업그레이드로 보고, 그보다 벌어지면 수동 삭제 후 신규 설치로 취급.
+UPGRADE_WINDOW_SEC = 60
+
 def _norm_exc_code(code: str) -> str:
     c = (code or '').strip().lower()
     return c[2:] if c.startswith('0x') else c
@@ -517,12 +521,22 @@ class EventLogWatcher:
         if eid == 1035:
             action = '업데이트'
         elif eid == 1033:
-            # 이전에 다른 버전이 설치돼 있었으면 업데이트로 분류
+            # 이전에 다른 버전이 설치돼 있었으면 업데이트로 분류하되,
+            # 사용자가 삭제한 뒤 시간이 지나 다시 설치한 경우는 신규 설치로 둔다.
             action = '설치'
             history = load_install_history()
             prev = next((e for e in reversed(history)
-                         if e.app_name == app_name and e.action in ('설치', '업데이트')), None)
-            if prev and prev.version != version:
+                         if e.app_name == app_name), None)
+            if prev and prev.action == '삭제':
+                gap = (ts - prev.timestamp).total_seconds()
+                if 0 <= gap <= UPGRADE_WINDOW_SEC:
+                    # 업그레이드 트랜잭션 내부의 제거 → 삭제 이전 버전과 비교
+                    before = next((e for e in reversed(history)
+                                   if e.app_name == app_name
+                                   and e.action in ('설치', '업데이트')), None)
+                    if before and before.version != version:
+                        action = '업데이트'
+            elif prev and prev.action in ('설치', '업데이트') and prev.version != version:
                 action = '업데이트'
         else:
             action = INSTALL_EVENT_IDS.get(eid, '알 수 없음')
