@@ -253,7 +253,7 @@ class InstallEvent:
     timestamp: datetime
     app_name:  str
     version:   str
-    action:    str   # '설치' | '삭제'
+    action:    str   # '설치' | '삭제' | '업데이트'
 
 
 def _to_dict(ev: CrashEvent) -> dict:
@@ -395,48 +395,51 @@ class EventLogWatcher:
             self._in_backfill = log_name in self._backfill_pending
             try:
                 handle = win32evtlog.OpenEventLog(None, log_name)
-                flags  = (win32evtlog.EVENTLOG_BACKWARDS_READ |
-                          win32evtlog.EVENTLOG_SEQUENTIAL_READ)
+                # ReadEventLog가 예외를 내도 핸들이 새지 않도록 열자마자
+                # try/finally로 닫기를 보장한다.
+                try:
+                    flags  = (win32evtlog.EVENTLOG_BACKWARDS_READ |
+                              win32evtlog.EVENTLOG_SEQUENTIAL_READ)
 
-                last_rec = self._last_record.get(log_name, None)
+                    last_rec = self._last_record.get(log_name, None)
 
-                # 저장 상태도 없는 진짜 첫 폴: 현재 최대 RecordNumber만 기록
-                if last_rec is None:
-                    chunk = win32evtlog.ReadEventLog(handle, flags, 0)
-                    if chunk:
-                        self._last_record[log_name] = max(e.RecordNumber for e in chunk)
-                    else:
-                        self._last_record[log_name] = 0
-                    win32evtlog.CloseEventLog(handle)
-                    continue
+                    # 저장 상태도 없는 진짜 첫 폴: 현재 최대 RecordNumber만 기록
+                    if last_rec is None:
+                        chunk = win32evtlog.ReadEventLog(handle, flags, 0)
+                        if chunk:
+                            self._last_record[log_name] = max(e.RecordNumber for e in chunk)
+                        else:
+                            self._last_record[log_name] = 0
+                        continue
 
-                new_max = last_rec
-                newest  = None   # 로그의 현재 최신 RecordNumber (초기화 감지용)
-                to_process = []
-                done = False
-                while not done:
-                    chunk = win32evtlog.ReadEventLog(handle, flags, 0)
-                    if not chunk:
-                        break
-                    for ev in chunk:
-                        if newest is None:
-                            newest = ev.RecordNumber
-                        if ev.RecordNumber <= last_rec:
-                            done = True
-                            break
-                        new_max = max(new_max, ev.RecordNumber)
-                        eid = ev.EventID & 0xFFFF
-                        if eid in CRASH_EVENT_IDS or eid in INSTALL_EVENT_IDS:
-                            to_process.append(ev)
-
-                # 이벤트 로그가 초기화되어 번호가 뒤로 돌아간 경우: 저장 상태를
-                # 버리고 현재 위치부터 다시 감시 (이 폴의 수집분은 신뢰 불가)
-                if newest is not None and newest < last_rec:
-                    new_max = newest
+                    new_max = last_rec
+                    newest  = None   # 로그의 현재 최신 RecordNumber (초기화 감지용)
                     to_process = []
+                    done = False
+                    while not done:
+                        chunk = win32evtlog.ReadEventLog(handle, flags, 0)
+                        if not chunk:
+                            break
+                        for ev in chunk:
+                            if newest is None:
+                                newest = ev.RecordNumber
+                            if ev.RecordNumber <= last_rec:
+                                done = True
+                                break
+                            new_max = max(new_max, ev.RecordNumber)
+                            eid = ev.EventID & 0xFFFF
+                            if eid in CRASH_EVENT_IDS or eid in INSTALL_EVENT_IDS:
+                                to_process.append(ev)
 
-                self._last_record[log_name] = new_max
-                win32evtlog.CloseEventLog(handle)
+                    # 이벤트 로그가 초기화되어 번호가 뒤로 돌아간 경우: 저장 상태를
+                    # 버리고 현재 위치부터 다시 감시 (이 폴의 수집분은 신뢰 불가)
+                    if newest is not None and newest < last_rec:
+                        new_max = newest
+                        to_process = []
+
+                    self._last_record[log_name] = new_max
+                finally:
+                    win32evtlog.CloseEventLog(handle)
 
                 # 오래된 것부터 순서대로 처리. 레코드 번호는 이미 위에서
                 # 전진시켰으므로, 이벤트 1건이 예외를 내도 같은 배치의
@@ -939,10 +942,13 @@ class HistoryWindow:
             expanded = [True]
 
             def _toggle(cf=cards_frame, btn_ref=None, state=expanded,
+                        after_widget=grp,
                         lbl_open=f'▾  {label}', lbl_close=f'▸  {label}'):
                 state[0] = not state[0]
                 if state[0]:
-                    cf.pack(fill=tk.X)
+                    # 나중에 다시 pack해도 자기 날짜 헤더 바로 아래에 위치하도록
+                    # after=로 고정한다 (지정 없이 pack하면 맨 아래로 밀려남).
+                    cf.pack(fill=tk.X, after=after_widget)
                     btn_ref.config(text=lbl_open)
                 else:
                     cf.pack_forget()
@@ -2045,23 +2051,49 @@ class QAMonitor:
 
         self._icon.run(setup=on_setup)
 
-    def _notify_start(self):
-        msg = 'ezFinder · ezCapture · ezCam · ezMemo · ezZip · ezManager 감시 중'
-        if HAS_TOAST:
-            threading.Thread(
-                target=lambda: _toaster.show_toast(
-                    'ezLab QA Monitor 시작됨', msg,
-                    icon_path=str(LOGO_ICO) if LOGO_ICO.exists() else None,
-                    duration=5, threaded=False,
-                    callback_on_click=self._show_history,
-                ),
-                daemon=True,
-            ).start()
-        else:
+    def _toast(self, title: str, msg: str, duration: int = 8,
+               on_click: Optional[Callable] = None):
+        """토스트 알림 공통 헬퍼.
+
+        win10toast 표준판(0.9)의 show_toast()에는 callback_on_click 파라미터가
+        없다(win10toast-click 포크 전용). 표준판 환경에서 넘기면 알림 스레드가
+        TypeError로 조용히 죽어 토스트가 아예 안 뜨므로, 콜백은 지원되는
+        환경에서만 시도하고 TypeError면 콜백 없이 재시도한다. 그래도 실패하면
+        트레이 풍선 알림(_icon.notify)으로 폴백한다."""
+        def _fallback():
             try:
-                self._icon.notify(msg, title='ezLab QA Monitor 시작됨')
+                if self._icon:
+                    self._icon.notify(msg, title=title)
             except Exception:
                 pass
+
+        if not HAS_TOAST:
+            _fallback()
+            return
+
+        def _worker():
+            kwargs = dict(
+                icon_path=str(LOGO_ICO) if LOGO_ICO.exists() else None,
+                duration=duration, threaded=False,
+            )
+            try:
+                if on_click is not None:
+                    try:
+                        _toaster.show_toast(title, msg,
+                                            callback_on_click=on_click, **kwargs)
+                        return
+                    except TypeError:
+                        pass  # 표준판: 콜백 미지원 → 아래에서 콜백 없이 재시도
+                _toaster.show_toast(title, msg, **kwargs)
+            except Exception:
+                _fallback()
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _notify_start(self):
+        msg = 'ezFinder · ezCapture · ezCam · ezMemo · ezZip · ezManager 감시 중'
+        self._toast('ezLab QA Monitor 시작됨', msg,
+                    duration=5, on_click=self._show_history)
 
     def _idle_title(self) -> str:
         if self._last_checked:
@@ -2083,20 +2115,7 @@ class QAMonitor:
 
     def _notify_watch_error(self):
         msg = 'Windows 이벤트 로그 읽기가 계속 실패하고 있습니다. 모니터링이 멈췄을 수 있습니다.'
-        if HAS_TOAST:
-            threading.Thread(
-                target=lambda: _toaster.show_toast(
-                    '[이지랩 QA] 모니터링 오류', msg,
-                    icon_path=str(LOGO_ICO) if LOGO_ICO.exists() else None,
-                    duration=8, threaded=False,
-                ),
-                daemon=True,
-            ).start()
-        elif self._icon:
-            try:
-                self._icon.notify(msg, title='[이지랩 QA] 모니터링 오류')
-            except Exception:
-                pass
+        self._toast('[이지랩 QA] 모니터링 오류', msg)
 
     def _on_crash(self, ev: CrashEvent, backfill: bool = False):
         with self._lock:
@@ -2128,21 +2147,7 @@ class QAMonitor:
             self._icon.title = f'ezLab QA Monitor — {count}건 감지'
 
         msg = f'{ev.app_name}  |  {ev.error_type}\n{ev.summary[:100]}'
-        if HAS_TOAST:
-            threading.Thread(
-                target=lambda: _toaster.show_toast(
-                    '[이지랩 QA] 크래시 감지', msg,
-                    icon_path=str(LOGO_ICO) if LOGO_ICO.exists() else None,
-                    duration=8, threaded=False,
-                    callback_on_click=self._show_history,
-                ),
-                daemon=True,
-            ).start()
-        else:
-            try:
-                self._icon.notify(msg, title='[이지랩 QA] 크래시 감지')
-            except Exception:
-                pass
+        self._toast('[이지랩 QA] 크래시 감지', msg, on_click=self._show_history)
 
     def _on_install(self, ev: InstallEvent):
         with self._lock:
@@ -2165,21 +2170,8 @@ class QAMonitor:
             self._icon.icon  = self._make_tray_icon(alert=True)
             self._icon.title = f'ezLab QA Monitor — 미실행 중 발생분 {count}건 발견'
         msg = f'모니터가 꺼져 있던 동안 발생한 이벤트 {count}건을 이력에 추가했습니다.'
-        if HAS_TOAST:
-            threading.Thread(
-                target=lambda: _toaster.show_toast(
-                    '[이지랩 QA] 미실행 구간 이벤트 발견', msg,
-                    icon_path=str(LOGO_ICO) if LOGO_ICO.exists() else None,
-                    duration=8, threaded=False,
-                    callback_on_click=self._show_history,
-                ),
-                daemon=True,
-            ).start()
-        else:
-            try:
-                self._icon.notify(msg, title='[이지랩 QA] 미실행 구간 이벤트 발견')
-            except Exception:
-                pass
+        self._toast('[이지랩 QA] 미실행 구간 이벤트 발견', msg,
+                    on_click=self._show_history)
 
     def _on_stack_trace(self, proc_name: str, dump_ts: datetime, stack_text: str):
         # 덤프에서 분석해낸 관리 코드 스택 트레이스를, 시간/프로세스명이
