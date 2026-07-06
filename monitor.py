@@ -9,7 +9,6 @@ import sys
 import csv
 import gc
 import json
-import inspect
 import queue
 import threading
 import subprocess
@@ -32,22 +31,14 @@ import win32event
 import win32api
 import winerror
 
+# Windows 알림 센터 정식 API(WinRT) 기반. 구 win10toast는 유지보수 중단
+# (setuptools 81+에서 pkg_resources 제거로 import 자체가 실패)이고 클릭
+# 콜백도 포크 전용이라 v1.3.0에서 교체했다.
 try:
-    from win10toast import ToastNotifier
-    _toaster = ToastNotifier()
-    # 클릭 콜백(callback_on_click)은 win10toast-click 포크 전용 파라미터.
-    # 표준판에 넘기면 TypeError로 알림 스레드가 조용히 죽으므로,
-    # 시그니처를 여기서 한 번만 검사해 지원 여부를 확정한다.
-    TOAST_HAS_CALLBACK = ('callback_on_click'
-                          in inspect.signature(ToastNotifier.show_toast).parameters)
+    from windows_toasts import Toast, ToastDuration, WindowsToaster
+    HAS_WINDOWS_TOASTS = True
 except Exception:
-    _toaster = None
-    TOAST_HAS_CALLBACK = False
-
-# ToastNotifier는 창 핸들(hwnd)을 인스턴스에 저장하기 때문에 토스트 두 개가
-# 겹치면 서로의 핸들을 덮어써, 먼저 뜬 쪽의 DestroyWindow가 표시 완료 후에
-# 예외를 낸다(→ 폴백이 중복 알림 발송). 호출을 직렬화해 한 번에 하나만 띄운다.
-_toast_lock = threading.Lock()
+    HAS_WINDOWS_TOASTS = False
 
 
 # ── 경로 ─────────────────────────────────────────────────────────
@@ -2033,6 +2024,12 @@ class QAMonitor:
         self._install_history: List[InstallEvent] = load_install_history()
         self._lock = threading.Lock()
         self._icon: Optional[pystray.Icon] = None
+        # AUMID로 만들어야 _register_aumid()가 등록한 표시명/로고가 알림에
+        # 나온다. 미지원 OS 등 생성 실패 시 None → _toast가 풍선으로 폴백.
+        try:
+            self._toaster = WindowsToaster(APP_AUMID) if HAS_WINDOWS_TOASTS else None
+        except Exception:
+            self._toaster = None
         self._watcher = EventLogWatcher(self._on_crash, self._on_install, self._on_poll,
                                         self._on_backfill_done)
         self._dump_watcher = DumpWatcher(self._on_stack_trace)
@@ -2065,34 +2062,27 @@ class QAMonitor:
 
     def _toast(self, title: str, msg: str, duration: int = 8,
                on_click: Optional[Callable] = None):
-        """토스트 알림 공통 헬퍼. 클릭 콜백은 지원 환경(win10toast-click)에서만
-        넘기고, 토스트 발송이 실패하면 트레이 풍선 알림(_icon.notify)으로
-        폴백한다."""
-        def _fallback():
+        """토스트 알림 공통 헬퍼. 클릭하면 on_click 실행(알림 센터 정식 지원).
+        발송 실패 시 트레이 풍선 알림(_icon.notify)으로 폴백한다.
+        show()는 즉시 반환(fire-and-forget)이라 스레드/직렬화가 필요 없다."""
+        try:
+            if self._toaster is None:
+                raise RuntimeError('windows_toasts unavailable')
+            toast = Toast(
+                # 알림 센터 토스트는 텍스트 3줄 제한: 제목 + 본문 최대 2줄
+                text_fields=[title, *msg.splitlines()[:2]],
+                duration=(ToastDuration.Short if duration <= 5
+                          else ToastDuration.Default),
+            )
+            if on_click is not None:
+                toast.on_activated = lambda _args: on_click()
+            self._toaster.show_toast(toast)
+        except Exception:
             try:
                 if self._icon:
                     self._icon.notify(msg, title=title)
             except Exception:
                 pass
-
-        if _toaster is None:
-            _fallback()
-            return
-
-        def _worker():
-            kwargs = dict(
-                icon_path=str(LOGO_ICO) if LOGO_ICO.exists() else None,
-                duration=duration, threaded=False,
-            )
-            if TOAST_HAS_CALLBACK and on_click is not None:
-                kwargs['callback_on_click'] = on_click
-            try:
-                with _toast_lock:
-                    _toaster.show_toast(title, msg, **kwargs)
-            except Exception:
-                _fallback()
-
-        threading.Thread(target=_worker, daemon=True).start()
 
     def _notify_start(self):
         msg = 'ezFinder · ezCapture · ezCam · ezMemo · ezZip · ezManager 감시 중'
