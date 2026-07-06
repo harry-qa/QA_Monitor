@@ -9,6 +9,7 @@ import sys
 import csv
 import gc
 import json
+import inspect
 import queue
 import threading
 import subprocess
@@ -34,9 +35,19 @@ import winerror
 try:
     from win10toast import ToastNotifier
     _toaster = ToastNotifier()
-    HAS_TOAST = True
+    # 클릭 콜백(callback_on_click)은 win10toast-click 포크 전용 파라미터.
+    # 표준판에 넘기면 TypeError로 알림 스레드가 조용히 죽으므로,
+    # 시그니처를 여기서 한 번만 검사해 지원 여부를 확정한다.
+    TOAST_HAS_CALLBACK = ('callback_on_click'
+                          in inspect.signature(ToastNotifier.show_toast).parameters)
 except Exception:
-    HAS_TOAST = False
+    _toaster = None
+    TOAST_HAS_CALLBACK = False
+
+# ToastNotifier는 창 핸들(hwnd)을 인스턴스에 저장하기 때문에 토스트 두 개가
+# 겹치면 서로의 핸들을 덮어써, 먼저 뜬 쪽의 DestroyWindow가 표시 완료 후에
+# 예외를 낸다(→ 폴백이 중복 알림 발송). 호출을 직렬화해 한 번에 하나만 띄운다.
+_toast_lock = threading.Lock()
 
 
 # ── 경로 ─────────────────────────────────────────────────────────
@@ -439,7 +450,12 @@ class EventLogWatcher:
 
                     self._last_record[log_name] = new_max
                 finally:
-                    win32evtlog.CloseEventLog(handle)
+                    # 레코드 포인터는 이미 전진했으므로 닫기 실패가 아래의
+                    # 이벤트 발행까지 중단시키면 수집분이 영구 유실된다.
+                    try:
+                        win32evtlog.CloseEventLog(handle)
+                    except Exception:
+                        pass
 
                 # 오래된 것부터 순서대로 처리. 레코드 번호는 이미 위에서
                 # 전진시켰으므로, 이벤트 1건이 예외를 내도 같은 배치의
@@ -918,6 +934,26 @@ class HistoryWindow:
         self._card_bars.clear()
         self._build_date_groups(self._card_container)
 
+    @staticmethod
+    def _make_collapsible(body: tk.Frame, anchor: tk.Widget, btn,
+                          lbl_open: str, lbl_close: str,
+                          expanded: bool, **pack_kw):
+        """접기/펼치기 토글 콜백 생성. 다시 pack할 때 항상 anchor 바로 아래로
+        들어가도록 after=anchor로 고정한다 (pack은 기본적으로 맨 뒤에
+        추가되므로, 지정 없이 재pack하면 목록 맨 아래로 밀려남)."""
+        state = [expanded]
+
+        def _toggle():
+            state[0] = not state[0]
+            if state[0]:
+                body.pack(after=anchor, **pack_kw)
+                btn.config(text=lbl_open)
+            else:
+                body.pack_forget()
+                btn.config(text=lbl_close)
+
+        return _toggle
+
     def _build_date_groups(self, parent: tk.Frame):
         from collections import defaultdict
         groups: dict = defaultdict(list)
@@ -939,21 +975,6 @@ class HistoryWindow:
             cards_frame = tk.Frame(parent, bg=BG)
             cards_frame.pack(fill=tk.X)
 
-            expanded = [True]
-
-            def _toggle(cf=cards_frame, btn_ref=None, state=expanded,
-                        after_widget=grp,
-                        lbl_open=f'▾  {label}', lbl_close=f'▸  {label}'):
-                state[0] = not state[0]
-                if state[0]:
-                    # 나중에 다시 pack해도 자기 날짜 헤더 바로 아래에 위치하도록
-                    # after=로 고정한다 (지정 없이 pack하면 맨 아래로 밀려남).
-                    cf.pack(fill=tk.X, after=after_widget)
-                    btn_ref.config(text=lbl_open)
-                else:
-                    cf.pack_forget()
-                    btn_ref.config(text=lbl_close)
-
             hdr_btn = tk.Button(
                 grp, text=f'▾  {label}',
                 font=('Segoe UI', 9, 'bold'),
@@ -961,7 +982,9 @@ class HistoryWindow:
                 relief=tk.FLAT, bd=0, anchor=tk.W,
                 padx=16, pady=9, cursor='hand2',
                 activebackground=BORDER, activeforeground=FG)
-            hdr_btn.config(command=lambda b=hdr_btn, fn=_toggle: fn(btn_ref=b))
+            hdr_btn.config(command=self._make_collapsible(
+                cards_frame, grp, hdr_btn,
+                f'▾  {label}', f'▸  {label}', expanded=True, fill=tk.X))
             hdr_btn.pack(fill=tk.X)
             tk.Frame(grp, bg=BORDER, height=1).pack(fill=tk.X)
 
@@ -1187,22 +1210,8 @@ class HistoryWindow:
             card = tk.Frame(self._install_frame, bg=PANEL)
             card.pack(fill=tk.X, padx=16, pady=(12, 0))
 
-            # 나중에 pack/pack_forget을 반복해도 항상 이 카드 바로 아래에
-            # 위치하도록 after=card로 고정한다 (pack은 기본적으로 맨 뒤에
-            # 추가되므로, 지정 없이 다시 pack하면 목록 맨 아래로 밀려남).
+            # 기본은 접힌 상태 — 헤더 클릭 시 _make_collapsible이 after=card로 pack
             rows_frame = tk.Frame(self._install_frame, bg=BG)
-            rows_frame.pack(fill=tk.X, padx=16, after=card)
-            rows_frame.pack_forget()
-            expanded = [False]
-
-            def _toggle(rf=rows_frame, btn_ref=None, state=expanded, after_widget=card):
-                state[0] = not state[0]
-                if state[0]:
-                    rf.pack(fill=tk.X, padx=16, after=after_widget)
-                    btn_ref.config(text='▾')
-                else:
-                    rf.pack_forget()
-                    btn_ref.config(text='▸')
 
             hdr = tk.Frame(card, bg=PANEL, cursor='hand2')
             hdr.pack(fill=tk.X)
@@ -1225,10 +1234,13 @@ class HistoryWindow:
                      font=('Segoe UI', 9), bg=PANEL, fg=latest_color
                      ).pack(side=tk.RIGHT, padx=14)
 
+            _toggle = self._make_collapsible(rows_frame, card, toggle_btn,
+                                             '▾', '▸', expanded=False,
+                                             fill=tk.X, padx=16)
             for w in (hdr, toggle_btn):
-                w.bind('<Button-1>', lambda e, b=toggle_btn, fn=_toggle: fn(btn_ref=b))
+                w.bind('<Button-1>', lambda e, fn=_toggle: fn())
             for child in hdr.winfo_children():
-                child.bind('<Button-1>', lambda e, b=toggle_btn, fn=_toggle: fn(btn_ref=b))
+                child.bind('<Button-1>', lambda e, fn=_toggle: fn())
 
             # 이벤트 행 (기본은 접혀있음, 헤더 클릭 시 펼침)
             for ev in events:
@@ -2053,13 +2065,9 @@ class QAMonitor:
 
     def _toast(self, title: str, msg: str, duration: int = 8,
                on_click: Optional[Callable] = None):
-        """토스트 알림 공통 헬퍼.
-
-        win10toast 표준판(0.9)의 show_toast()에는 callback_on_click 파라미터가
-        없다(win10toast-click 포크 전용). 표준판 환경에서 넘기면 알림 스레드가
-        TypeError로 조용히 죽어 토스트가 아예 안 뜨므로, 콜백은 지원되는
-        환경에서만 시도하고 TypeError면 콜백 없이 재시도한다. 그래도 실패하면
-        트레이 풍선 알림(_icon.notify)으로 폴백한다."""
+        """토스트 알림 공통 헬퍼. 클릭 콜백은 지원 환경(win10toast-click)에서만
+        넘기고, 토스트 발송이 실패하면 트레이 풍선 알림(_icon.notify)으로
+        폴백한다."""
         def _fallback():
             try:
                 if self._icon:
@@ -2067,7 +2075,7 @@ class QAMonitor:
             except Exception:
                 pass
 
-        if not HAS_TOAST:
+        if _toaster is None:
             _fallback()
             return
 
@@ -2076,15 +2084,11 @@ class QAMonitor:
                 icon_path=str(LOGO_ICO) if LOGO_ICO.exists() else None,
                 duration=duration, threaded=False,
             )
+            if TOAST_HAS_CALLBACK and on_click is not None:
+                kwargs['callback_on_click'] = on_click
             try:
-                if on_click is not None:
-                    try:
-                        _toaster.show_toast(title, msg,
-                                            callback_on_click=on_click, **kwargs)
-                        return
-                    except TypeError:
-                        pass  # 표준판: 콜백 미지원 → 아래에서 콜백 없이 재시도
-                _toaster.show_toast(title, msg, **kwargs)
+                with _toast_lock:
+                    _toaster.show_toast(title, msg, **kwargs)
             except Exception:
                 _fallback()
 
