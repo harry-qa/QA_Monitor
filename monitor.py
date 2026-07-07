@@ -1022,8 +1022,8 @@ class DumpWatcher:
         try:
             result = subprocess.run(
                 [str(DUMP_ANALYZER_EXE), str(dmp_path)],
-                capture_output=True, text=True, timeout=90,
-                creationflags=subprocess.CREATE_NO_WINDOW,
+                capture_output=True, text=True, encoding='utf-8', errors='replace',
+                timeout=90, creationflags=subprocess.CREATE_NO_WINDOW,
             )
             text = (result.stdout or '').strip()
         except Exception:
@@ -2229,8 +2229,30 @@ class HistoryWindow:
             pass
         return out
 
+    @staticmethod
+    def _analyze_dump_text(dmp: Path) -> Optional[str]:
+        """DumpAnalyzer --full로 사람이 읽는 전체 분석 리포트를 뽑는다.
+        분석기가 없거나 실패하면 None (원본 덤프만 ZIP에 담기고 진행)."""
+        if not DUMP_ANALYZER_EXE.exists():
+            return None
+        try:
+            result = subprocess.run(
+                [str(DUMP_ANALYZER_EXE), str(dmp), '--full'],
+                capture_output=True, text=True, encoding='utf-8', errors='replace',
+                timeout=180, creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+            text = (result.stdout or '').strip()
+        except Exception:
+            return None
+        if not text or text.startswith(('NO_CLR_RUNTIME_FOUND',
+                                        'NO_MANAGED_THREAD_FOUND', 'ANALYZER_ERROR')):
+            return None
+        return text
+
     def _export_report_zip(self, ev: CrashEvent):
-        """개발자 전달용 ZIP: 보고서 텍스트 + 연관 덤프(.dmp)를 한 파일로."""
+        """개발자 전달용 ZIP: 보고서 텍스트 + 연관 덤프(.dmp) + 각 덤프의 사람이
+        읽는 분석 리포트(.txt)를 한 파일로. 덤프 분석은 수십 초 걸릴 수 있어
+        워커 스레드에서 수행하고 버튼에 진행 상태를 표시한다."""
         proc_base = ev.process.rsplit('.', 1)[0] or 'unknown'
         path = filedialog.asksaveasfilename(
             defaultextension='.zip',
@@ -2240,23 +2262,51 @@ class HistoryWindow:
         if not path:
             return
         dumps = self._matching_dumps(ev)
-        try:
-            with zipfile.ZipFile(path, 'w', zipfile.ZIP_DEFLATED) as zf:
-                # utf-8-sig(BOM): 메모장/Excel에서 한글이 깨지지 않게 한다
-                zf.writestr('crash_report.txt',
-                            _make_report(ev).encode('utf-8-sig'))
-                for dmp in dumps:
-                    zf.write(dmp, dmp.name)
-        except Exception as ex:
-            messagebox.showerror('내보내기 실패', f'ZIP 저장 중 오류가 발생했습니다.\n{ex}')
-            return
-        if dumps:
-            names = '\n'.join(f'  · {d.name}' for d in dumps)
-            messagebox.showinfo('내보내기 완료',
-                                f'보고서와 덤프 {len(dumps)}개를 저장했습니다.\n{names}\n\n{path}')
-        else:
-            messagebox.showinfo('내보내기 완료',
-                                f'보고서를 저장했습니다 (연관 덤프 없음).\n{path}')
+
+        # 진행 표시 + 중복 클릭 방지
+        self._zip_btn.config(state=tk.DISABLED,
+                             text='📦  분석 중… (수십 초 소요)')
+
+        def _finish(err, saved_dumps, analyzed):
+            self._zip_btn.config(state=tk.NORMAL, text='📦  보고서+덤프 ZIP 저장')
+            if err:
+                messagebox.showerror('내보내기 실패', f'ZIP 저장 중 오류가 발생했습니다.\n{err}')
+            elif saved_dumps:
+                names = '\n'.join(f'  · {n}' for n in saved_dumps)
+                extra = (f'\n분석 리포트 {analyzed}개 포함(.dmp를 열지 않아도 스택 확인 가능)'
+                         if analyzed else '')
+                messagebox.showinfo('내보내기 완료',
+                                    f'보고서와 덤프 {len(saved_dumps)}개를 저장했습니다.'
+                                    f'{extra}\n{names}\n\n{path}')
+            else:
+                messagebox.showinfo('내보내기 완료',
+                                    f'보고서를 저장했습니다 (연관 덤프 없음).\n{path}')
+
+        def _worker():
+            err = None
+            saved = []
+            analyzed = 0
+            try:
+                with zipfile.ZipFile(path, 'w', zipfile.ZIP_DEFLATED) as zf:
+                    # utf-8-sig(BOM): 메모장/Excel에서 한글이 깨지지 않게 한다
+                    zf.writestr('crash_report.txt',
+                                _make_report(ev).encode('utf-8-sig'))
+                    for dmp in dumps:
+                        zf.write(dmp, dmp.name)
+                        saved.append(dmp.name)
+                        report = self._analyze_dump_text(dmp)
+                        if report:
+                            zf.writestr(f'{dmp.name}.analysis.txt',
+                                        report.encode('utf-8-sig'))
+                            analyzed += 1
+            except Exception as ex:
+                err = ex
+            # Tk 위젯 조작은 GUI 스레드에서만
+            root = self._root
+            if root is not None:
+                root.after(0, lambda: _finish(err, saved, analyzed))
+
+        threading.Thread(target=_worker, daemon=True).start()
 
 
 # ── 메인 앱 ──────────────────────────────────────────────────────
