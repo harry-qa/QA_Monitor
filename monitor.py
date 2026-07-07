@@ -10,8 +10,11 @@ import csv
 import gc
 import json
 import queue
+import msvcrt
+import zipfile
 import threading
 import subprocess
+from collections import deque
 import tkinter as tk
 from tkinter import ttk, scrolledtext, messagebox, filedialog
 from datetime import datetime, timedelta, timezone
@@ -156,6 +159,31 @@ INSTALL_EVENT_IDS = {
     1034: '삭제',
     1035: '업데이트',
 }
+
+# ── WER 부가 보고 상관 ────────────────────────────────────────────
+# Windows Error Reporting은 크래시/행 외에도 진단 보고(1001)를 남긴다.
+# 예: RADAR_PRE_LEAK(메모리 폭주 감지)는 행/크래시의 원인 힌트가 되므로
+# 같은 앱의 근접 이력 상세에 자동으로 첨부한다.
+WER_EVENT_ID = 1001
+
+# 1000/1002/1026으로 이미 캡처하는 크래시·행 자체의 WER 보고는 중복 제외
+WER_NOISE_EVENTS = {'APPCRASH', 'AppHangB1', 'AppHangXProcB1',
+                    'MoAppCrash', 'MoAppHang', 'BEX', 'BEX64', 'CLR20r3'}
+
+WER_EVENT_LABELS = {
+    'RADAR_PRE_LEAK_64':    '메모리 사용량 비정상 증가 감지 (Windows 리소스 고갈 감지기)',
+    'RADAR_PRE_LEAK_WOW64': '메모리 사용량 비정상 증가 감지 (리소스 고갈 감지기, 32비트 프로세스)',
+    'FaultTolerantHeap':    '힙 손상 완화(FTH) 심 적용됨 — 반복적 힙 손상 신호',
+}
+
+WER_CORRELATE_SEC   = 90    # 크래시/행 시각과 이 범위 내의 WER 보고를 연관으로 취급
+WER_SECTION_TITLE   = '[연관 WER 보고]'
+
+# ── 실시간 응답 없음 감시 ─────────────────────────────────────────
+# AppHang(1002)은 사용자가 창을 닫은 뒤에야 기록되고 WER 덤프도 남지 않아
+# 사후 분석이 불가능하다. 창이 이 시간 이상 연속 무응답이면 프로세스가
+# 살아 있는 동안 미니덤프를 떠 둔다.
+HANG_DUMP_AFTER_SEC = 10
 
 # MSI 메이저 업그레이드는 제거(1034)→설치(1033)를 한 트랜잭션에서 연달아 기록한다.
 # 이 간격 안의 삭제→설치만 업그레이드로 보고, 그보다 벌어지면 수동 삭제 후 신규 설치로 취급.
@@ -340,11 +368,13 @@ class EventLogWatcher:
     def __init__(self, on_event: Callable[[CrashEvent, bool], None],
                  on_install: Callable[[InstallEvent], None] = None,
                  on_poll: Callable[[bool], None] = None,
-                 on_backfill_done: Callable[[int], None] = None):
+                 on_backfill_done: Callable[[int], None] = None,
+                 on_wer: Callable[[datetime, str, str], None] = None):
         self._on_event   = on_event
         self._on_install = on_install
         self._on_poll    = on_poll
         self._on_backfill_done = on_backfill_done
+        self._on_wer     = on_wer
         self._stop       = threading.Event()
         # log_name -> last processed RecordNumber. 이전 실행에서 저장한 상태를
         # 이어받아, 모니터가 꺼져 있던 동안의 이벤트를 첫 폴에서 따라잡는다.
@@ -430,7 +460,8 @@ class EventLogWatcher:
                                 break
                             new_max = max(new_max, ev.RecordNumber)
                             eid = ev.EventID & 0xFFFF
-                            if eid in CRASH_EVENT_IDS or eid in INSTALL_EVENT_IDS:
+                            if (eid in CRASH_EVENT_IDS or eid in INSTALL_EVENT_IDS
+                                    or eid == WER_EVENT_ID):
                                 to_process.append(ev)
 
                     # 이벤트 로그가 초기화되어 번호가 뒤로 돌아간 경우: 저장 상태를
@@ -480,6 +511,24 @@ class EventLogWatcher:
         """이지랩 관련 이벤트를 실제로 발행했으면 True (백필 집계용)."""
         eid = ev.EventID & 0xFFFF
         ts  = self._to_dt(ev.TimeGenerated)
+
+        # ── WER 부가 보고 (1001: RADAR 메모리 폭주 감지 등) ──
+        # inserts: [0]bucket [1]type [2]EventName [3]response [4]cabId [5]P1(대상 exe)...
+        if eid == WER_EVENT_ID:
+            if ev.SourceName != 'Windows Error Reporting' or not self._on_wer:
+                return False
+            inserts    = list(ev.StringInserts or [])
+            event_name = self._ins(inserts, 2)
+            target_exe = self._ins(inserts, 5)
+            if (not event_name or not target_exe
+                    or event_name in WER_NOISE_EVENTS
+                    or not self._is_ezlab(target_exe, target_exe)):
+                return False
+            try:
+                self._on_wer(ts, event_name, target_exe)
+            except Exception:
+                pass
+            return False   # 부가 정보라 크래시/백필 집계에는 넣지 않는다
 
         # ── 설치/삭제 이벤트 ──
         if eid in INSTALL_EVENT_IDS and ev.SourceName == 'MsiInstaller':
@@ -761,6 +810,141 @@ class EventLogWatcher:
             return None
         return CrashEvent(ts, self._resolve(svc), svc, '서비스 시작 중 멈춤',
                           f'{svc} 서비스가 시작 중 응답 없음', detail)
+
+
+# ── 실시간 응답 없음 감시 (종료 전 덤프 선제 캡처) ─────────────────
+class HangWatcher:
+    """이지랩 앱 최상위 창의 '응답 없음' 상태를 실시간 감시한다.
+
+    AppHang(1002)은 사용자가 창을 닫은 뒤에야 이벤트가 남고 스택도 덤프도
+    없다. 여기서는 창이 HANG_DUMP_AFTER_SEC 이상 연속 무응답이면 프로세스가
+    살아 있는 동안 전체 메모리 미니덤프를 DUMP_DIR에 저장하고(WER 파일명
+    형식이라 DumpWatcher가 그대로 자동 분석) 콜백으로 알린다.
+    행이 회복되더라도 QA 관점에서는 보고 대상이므로 이벤트는 유지한다."""
+
+    def __init__(self, on_hang: Callable[[str, int, float, bool], None]):
+        self._on_hang    = on_hang
+        self._stop       = threading.Event()
+        self._hung_since = {}     # pid -> 최초 무응답 감지 시각
+        self._dumped     = set()  # 이미 덤프를 뜬 pid (프로세스 종료 시 정리)
+
+    def start(self):
+        threading.Thread(target=self._loop, daemon=True, name='HangWatcher').start()
+
+    def stop(self):
+        self._stop.set()
+
+    def _loop(self):
+        while not self._stop.wait(POLL_SECONDS):
+            try:
+                self._poll()
+            except Exception:
+                pass
+
+    @staticmethod
+    def _ezlab_windows():
+        """현재 세션의 가시 최상위 창 중 이지랩 프로세스 소유: [(hwnd, pid, exe)].
+        모니터 자신은 제외한다 (자기 창 리빌드 중 오탐 방지)."""
+        user32, kernel32 = ctypes.windll.user32, ctypes.windll.kernel32
+        found = []
+
+        @ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+        def _cb(hwnd, _):
+            if not user32.IsWindowVisible(hwnd):
+                return True
+            pid = ctypes.c_ulong()
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            if not pid.value:
+                return True
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            h = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid.value)
+            if not h:
+                return True
+            try:
+                buf  = ctypes.create_unicode_buffer(1024)
+                size = ctypes.c_ulong(1024)
+                if kernel32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(size)):
+                    exe = os.path.basename(buf.value)
+                    if (exe.lower() in EZLAB_APPS
+                            and exe.lower() != 'ezlabqamonitor.exe'):
+                        found.append((hwnd, pid.value, exe))
+            finally:
+                kernel32.CloseHandle(h)
+            return True
+
+        user32.EnumWindows(_cb, None)
+        return found
+
+    @staticmethod
+    def _is_hung(hwnd) -> bool:
+        user32 = ctypes.windll.user32
+        if user32.IsHungAppWindow(hwnd):
+            return True
+        # IsHungAppWindow는 사용자 입력 시도가 있어야 갱신되는 경우가 있어
+        # WM_NULL 응답 시간으로도 능동 확인한다 (2초 무응답 = 멈춤)
+        SMTO_ABORTIFHUNG = 0x0002
+        res = ctypes.c_ulong()
+        ok = user32.SendMessageTimeoutW(hwnd, 0, 0, 0,
+                                        SMTO_ABORTIFHUNG, 2000, ctypes.byref(res))
+        return not ok
+
+    def _poll(self):
+        now = datetime.now()
+        # pid 단위로 집계: 한 프로세스가 창을 여러 개 가질 수 있고(콘솔/보조
+        # 창은 응답하는데 메인 창만 멈추는 경우), 창 단위로 판정하면 정상
+        # 창이 무응답 상태를 매번 리셋해 감지가 영영 안 된다.
+        procs: dict = {}   # pid -> (exe, 하나라도 무응답인가)
+        for hwnd, pid, exe in self._ezlab_windows():
+            hung = self._is_hung(hwnd)
+            _, prev_hung = procs.get(pid, (exe, False))
+            procs[pid] = (exe, hung or prev_hung)
+
+        for pid, (exe, hung) in procs.items():
+            if not hung:
+                self._hung_since.pop(pid, None)
+                continue
+            first = self._hung_since.setdefault(pid, now)
+            hung_secs = (now - first).total_seconds()
+            if hung_secs >= HANG_DUMP_AFTER_SEC and pid not in self._dumped:
+                self._dumped.add(pid)
+                ok = self._write_dump(pid, exe)
+                try:
+                    self._on_hang(exe, pid, hung_secs, ok)
+                except Exception:
+                    pass
+        # 종료된 프로세스의 상태 정리 (pid 재사용 대비)
+        self._hung_since = {p: t for p, t in self._hung_since.items() if p in procs}
+        self._dumped &= set(procs)
+
+    @staticmethod
+    def _write_dump(pid: int, exe: str) -> bool:
+        """전체 메모리 미니덤프 저장. 파일명은 WER LocalDumps 형식
+        (<exe>.<pid>.dmp)이라 DumpWatcher/DumpAnalyzer 파이프라인을 그대로 탄다.
+        쓰는 동안 DumpWatcher가 미완성 파일을 집지 않도록 임시명 후 교체."""
+        try:
+            DUMP_DIR.mkdir(parents=True, exist_ok=True)
+            path = DUMP_DIR / f'{exe}.{pid}.dmp'
+            tmp  = path.with_name(path.name + '.tmp')
+            PROCESS_ALL_ACCESS      = 0x1F0FFF
+            MiniDumpWithFullMemory  = 0x2
+            kernel32 = ctypes.windll.kernel32
+            hproc = kernel32.OpenProcess(PROCESS_ALL_ACCESS, False, pid)
+            if not hproc:
+                return False
+            try:
+                with open(tmp, 'wb') as f:
+                    ok = ctypes.windll.dbghelp.MiniDumpWriteDump(
+                        hproc, pid, msvcrt.get_osfhandle(f.fileno()),
+                        MiniDumpWithFullMemory, None, None, None)
+            finally:
+                kernel32.CloseHandle(hproc)
+            if ok:
+                os.replace(tmp, path)
+            else:
+                tmp.unlink(missing_ok=True)
+            return bool(ok)
+        except Exception:
+            return False
 
 
 # ── 크래시 덤프 감시 (ClrMD 기반 관리 코드 스택 트레이스 자동 분석) ──
@@ -1614,7 +1798,17 @@ class HistoryWindow:
             cursor='hand2', activebackground=MAUVE, activeforeground='#FFFFFF',
         )
         self._copy_btn.pack(side=tk.LEFT)
-        tk.Label(btn_frame, text='클립보드에 복사되면 바로 붙여넣기 가능합니다',
+
+        self._zip_btn = tk.Button(
+            btn_frame,
+            text='📦  보고서+덤프 ZIP 저장',
+            font=('Segoe UI', 10, 'bold'),
+            bg=TEAL, fg='#FFFFFF',
+            relief=tk.FLAT, padx=18, pady=7,
+            cursor='hand2', activebackground=GREEN, activeforeground='#FFFFFF',
+        )
+        self._zip_btn.pack(side=tk.LEFT, padx=(10, 0))
+        tk.Label(btn_frame, text='복사는 클립보드로, ZIP은 연관 덤프(.dmp)까지 함께 저장합니다',
                  font=('Segoe UI', 9), bg=SURFACE, fg=MUTED).pack(side=tk.LEFT, padx=10)
 
         tk.Frame(parent, bg=BORDER, height=1).pack(fill=tk.X)
@@ -1811,8 +2005,9 @@ class HistoryWindow:
             txt.config(state=tk.NORMAL)
             txt.delete('1.0', tk.END)
             txt.config(state=tk.DISABLED)
-        # 삭제된 항목의 리포트가 복사되지 않도록 복사 버튼도 초기화
+        # 삭제된 항목의 리포트가 복사/저장되지 않도록 버튼도 초기화
         self._copy_btn.config(command=lambda: None)
+        self._zip_btn.config(command=lambda: None)
 
     def _on_mousewheel(self, e):
         delta = -1 * (e.delta // 120)
@@ -2015,6 +2210,53 @@ class HistoryWindow:
                 self._root.after(2000, lambda: self._copy_btn.config(text='📋  개발자 보고서 복사')),
             )
         )
+        self._zip_btn.config(command=lambda: self._export_report_zip(ev))
+
+    @staticmethod
+    def _matching_dumps(ev: CrashEvent, window_sec: int = 300) -> list:
+        """이벤트와 프로세스명·시각이 맞는 덤프 파일 목록.
+        파일명은 WER LocalDumps 형식 <exe>.<pid>.dmp (HangWatcher도 동일)."""
+        out = []
+        try:
+            for dmp in DUMP_DIR.glob('*.dmp'):
+                base = dmp.stem.rsplit('.', 1)[0]
+                if base.lower() != ev.process.lower():
+                    continue
+                mtime = datetime.fromtimestamp(dmp.stat().st_mtime)
+                if abs((ev.timestamp - mtime).total_seconds()) <= window_sec:
+                    out.append(dmp)
+        except Exception:
+            pass
+        return out
+
+    def _export_report_zip(self, ev: CrashEvent):
+        """개발자 전달용 ZIP: 보고서 텍스트 + 연관 덤프(.dmp)를 한 파일로."""
+        proc_base = ev.process.rsplit('.', 1)[0] or 'unknown'
+        path = filedialog.asksaveasfilename(
+            defaultextension='.zip',
+            filetypes=[('ZIP 파일', '*.zip')],
+            initialfile=(f'ezlab_report_{proc_base}_'
+                         f'{ev.timestamp.strftime("%Y%m%d_%H%M%S")}.zip'))
+        if not path:
+            return
+        dumps = self._matching_dumps(ev)
+        try:
+            with zipfile.ZipFile(path, 'w', zipfile.ZIP_DEFLATED) as zf:
+                # utf-8-sig(BOM): 메모장/Excel에서 한글이 깨지지 않게 한다
+                zf.writestr('crash_report.txt',
+                            _make_report(ev).encode('utf-8-sig'))
+                for dmp in dumps:
+                    zf.write(dmp, dmp.name)
+        except Exception as ex:
+            messagebox.showerror('내보내기 실패', f'ZIP 저장 중 오류가 발생했습니다.\n{ex}')
+            return
+        if dumps:
+            names = '\n'.join(f'  · {d.name}' for d in dumps)
+            messagebox.showinfo('내보내기 완료',
+                                f'보고서와 덤프 {len(dumps)}개를 저장했습니다.\n{names}\n\n{path}')
+        else:
+            messagebox.showinfo('내보내기 완료',
+                                f'보고서를 저장했습니다 (연관 덤프 없음).\n{path}')
 
 
 # ── 메인 앱 ──────────────────────────────────────────────────────
@@ -2031,8 +2273,11 @@ class QAMonitor:
         except Exception:
             self._toaster = None
         self._watcher = EventLogWatcher(self._on_crash, self._on_install, self._on_poll,
-                                        self._on_backfill_done)
+                                        self._on_backfill_done, self._on_wer)
         self._dump_watcher = DumpWatcher(self._on_stack_trace)
+        self._hang_watcher = HangWatcher(self._on_hang)
+        # 최근 WER 부가 보고 (크래시가 나중에 도착하는 경우의 선-첨부용)
+        self._recent_wer: deque = deque(maxlen=20)
         self._open_window: Optional[HistoryWindow] = None
         self._last_checked: Optional[datetime] = None
         self._consec_fail  = 0
@@ -2041,6 +2286,7 @@ class QAMonitor:
     def run(self):
         self._watcher.start()
         self._dump_watcher.start()
+        self._hang_watcher.start()
 
         menu = pystray.Menu(
             pystray.MenuItem('크래시 이력 보기', self._show_history, default=True),
@@ -2111,8 +2357,68 @@ class QAMonitor:
         msg = 'Windows 이벤트 로그 읽기가 계속 실패하고 있습니다. 모니터링이 멈췄을 수 있습니다.'
         self._toast('[이지랩 QA] 모니터링 오류', msg)
 
+    @staticmethod
+    def _append_wer_line(ev: CrashEvent, line: str) -> bool:
+        """이력 상세에 연관 WER 보고 한 줄 추가 (섹션 생성/중복 방지).
+        호출자가 _lock을 보유한 상태여야 한다."""
+        if line in ev.detail:
+            return False
+        if WER_SECTION_TITLE in ev.detail:
+            ev.detail += '\n' + line
+        else:
+            ev.detail += f'\n\n{WER_SECTION_TITLE}\n' + '─' * 48 + '\n' + line
+        return True
+
+    def _on_wer(self, ts: datetime, event_name: str, target_exe: str):
+        """WER 부가 보고(1001) 수신: 근접한 기존 이력에 소급 첨부하고,
+        크래시/행 이벤트가 아직 안 온 경우를 위해 최근 목록에도 보관한다."""
+        label = WER_EVENT_LABELS.get(event_name)
+        line  = (f'{ts.strftime("%Y-%m-%d %H:%M:%S")}  {event_name}'
+                 + (f' — {label}' if label else ''))
+        with self._lock:
+            self._recent_wer.append((ts, target_exe.lower(), line))
+            snapshot = None
+            for ev in reversed(self._history):
+                if (ev.process.lower() == target_exe.lower()
+                        and abs((ev.timestamp - ts).total_seconds()) <= WER_CORRELATE_SEC):
+                    if self._append_wer_line(ev, line):
+                        snapshot = list(self._history)
+                    break
+        if snapshot is not None:
+            save_history(snapshot)
+
+    def _on_hang(self, exe: str, pid: int, hung_secs: float, dump_ok: bool):
+        """HangWatcher 콜백: 응답 없음을 실시간으로 잡았을 때. 프로세스가 아직
+        살아 있으므로 1002보다 먼저 이력에 남고, 캡처된 덤프는 DumpWatcher가
+        분석해 스택을 이 이력에 자동 첨부한다."""
+        ts  = datetime.now()
+        sep = '─' * 48
+        dump_path = DUMP_DIR / f'{exe}.{pid}.dmp'
+        detail = (
+            f'감지 방식   : 실시간 응답 없음 감시 (HangWatcher)\n'
+            f'프로세스    : {exe}  (PID {pid})\n'
+            f'감지 시각   : {ts.strftime("%Y-%m-%d %H:%M:%S")}\n'
+            f'무응답 지속 : {int(hung_secs)}초 이상\n'
+            f'덤프 캡처   : {"성공 — " + str(dump_path) if dump_ok else "실패"}\n'
+            f'{sep}\n'
+            'Windows가 AppHang(1002)으로 기록하기 전, 프로세스 생존 중에 선제\n'
+            '감지한 이벤트입니다. 이후 사용자가 창을 닫으면 별도의 "응답 없음\n'
+            '(Hang)" 이력이 추가로 남을 수 있습니다. 덤프가 캡처된 경우 관리\n'
+            '코드 스택은 잠시 후 자동 분석되어 이 상세에 첨부됩니다.'
+        )
+        ev = CrashEvent(ts, self._watcher._resolve(exe), exe,
+                        '응답 없음 감지 (실시간)',
+                        f'UI 응답 없음 {int(hung_secs)}초 경과 — 종료 전 덤프 '
+                        f'{"캡처 완료" if dump_ok else "캡처 실패"}', detail)
+        self._on_crash(ev)
+
     def _on_crash(self, ev: CrashEvent, backfill: bool = False):
         with self._lock:
+            # 먼저 도착해 있던 연관 WER 보고(RADAR 등)를 상세에 선-첨부
+            for wts, wproc, wline in self._recent_wer:
+                if (wproc == ev.process.lower()
+                        and abs((ev.timestamp - wts).total_seconds()) <= WER_CORRELATE_SEC):
+                    self._append_wer_line(ev, wline)
             self._history.append(ev)
             count = len(self._history)
             win = self._open_window
