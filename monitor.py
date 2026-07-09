@@ -140,6 +140,30 @@ EZLAB_KEYWORDS = set(EZLAB_APPS.keys()) | {
     'ezzip', 'ezmanager', 'ezlab', 'mobsoft',
 }
 
+# 이지랩 제품 키워드 → 표시명. 셸 확장(예: ezZipShell)이 자기 exe가 아니라
+# 호스트 프로세스(dllhost.exe = COM Surrogate 등) 안에서 돌다 멈추면, 이벤트의
+# '앱 이름'은 껍데기(dllhost.exe)로 찍힌다. 패키지명·모듈경로 같은 문자열에서
+# 실제 제품을 식별해 이름을 바로잡는 데 쓴다.
+EZLAB_PRODUCT_KEYWORDS = (
+    ('ezfinder', 'ezFinder'), ('ezcapture', 'ezCapture'),
+    ('ezcam', 'ezCam'), ('ezmemo', 'ezMemo'),
+    ('ezzip', 'ezZip'), ('ezmanager', 'ezManager'),
+)
+
+# 이지랩 셸 확장을 대신 실행할 수 있는 호스트 프로세스 (이 프로세스가 이지랩
+# 모듈/패키지를 물고 멈추면 제품 크래시로 간주해 이름을 바로잡고 덤프를 뜬다)
+SHELL_HOST_PROCESSES = {'dllhost.exe', 'rundll32.exe'}
+
+
+def ezlab_product_of(*texts) -> Optional[str]:
+    """주어진 문자열들(패키지명/앱ID/모듈경로 등)에서 이지랩 제품을 식별해
+    표시명을 돌려준다. 해당 없으면 None."""
+    blob = ' '.join(t for t in texts if t).lower()
+    for kw, name in EZLAB_PRODUCT_KEYWORDS:
+        if kw in blob:
+            return name
+    return None
+
 CRASH_EVENT_IDS = {
     1000: 'APPCRASH',
     1002: 'AppHang',
@@ -744,8 +768,11 @@ class EventLogWatcher:
                           f'충돌 모듈: {module}  |  {exc_label}', detail)
 
     def _hang(self, ts, msg, detail, inserts) -> Optional[CrashEvent]:
-        # inserts[0]=앱명, [9]=Hang 유형 (이벤트 1002에는 대기 시간 파라미터가 없음)
+        # inserts[0]=앱명, [7]=패키지명, [8]=패키지 앱 ID, [9]=Hang 유형
+        # (이벤트 1002에는 대기 시간 파라미터가 없음)
         proc      = self._ins(inserts, 0)
+        pkg_name  = self._ins(inserts, 7)
+        pkg_id    = self._ins(inserts, 8)
         hang_type = self._ins(inserts, 9)
 
         if not proc:
@@ -758,10 +785,26 @@ class EventLogWatcher:
                             proc = words[i + 1]; break
                     break
 
-        summary = 'UI 스레드 응답 없음 — Windows에 의해 강제 종료됨'
+        # 호스트 프로세스(dllhost 등)가 이지랩 셸 확장을 대신 실행하다 멈춘 경우:
+        # 이벤트의 앱 이름은 껍데기(dllhost.exe)라, 패키지 정보로 실제 제품을
+        # 식별해 app_name을 바로잡는다. process는 덤프 파일명(<exe>.<pid>.dmp)
+        # 매칭에 쓰이므로 원본 exe(dllhost.exe)를 그대로 유지한다.
+        app_name = self._resolve(proc)
+        shell_of = None
+        if proc.lower() not in EZLAB_APPS:
+            shell_of = ezlab_product_of(pkg_id, pkg_name)
+            if shell_of:
+                app_name = f'{shell_of} (셸 확장)'
+
+        if shell_of:
+            short = pkg_name.split('_', 1)[0] if pkg_name else f'{shell_of}Shell'
+            summary = (f'{shell_of} 셸 확장({short})이 {proc} 안에서 응답 없음 '
+                       '— Windows에 의해 강제 종료됨')
+        else:
+            summary = 'UI 스레드 응답 없음 — Windows에 의해 강제 종료됨'
         if hang_type:
             summary += f'  |  Hang 유형: {hang_type}'
-        return CrashEvent(ts, self._resolve(proc), proc,
+        return CrashEvent(ts, app_name, proc,
                           '응답 없음 (Hang)', summary, detail)
 
     def _service(self, ts, msg, detail, inserts) -> Optional[CrashEvent]:
@@ -822,7 +865,7 @@ class HangWatcher:
     형식이라 DumpWatcher가 그대로 자동 분석) 콜백으로 알린다.
     행이 회복되더라도 QA 관점에서는 보고 대상이므로 이벤트는 유지한다."""
 
-    def __init__(self, on_hang: Callable[[str, int, float, bool], None]):
+    def __init__(self, on_hang: Callable[[str, int, float, bool, str], None]):
         self._on_hang    = on_hang
         self._stop       = threading.Event()
         self._hung_since = {}     # pid -> 최초 무응답 감지 시각
@@ -842,9 +885,49 @@ class HangWatcher:
                 pass
 
     @staticmethod
+    def _ezlab_shell_product(pid: int) -> Optional[str]:
+        """대상 프로세스가 로드한 모듈 경로를 훑어 이지랩 셸 확장을 물고 있으면
+        제품 표시명을 돌려준다(없으면 None). dllhost.exe 같은 호스트가 이지랩
+        셸 확장을 대신 실행 중인지 판별하는 데 쓴다 — 관계없는 dllhost는 여기서
+        걸러져 덤프/이력 노이즈가 생기지 않는다."""
+        PROCESS_QUERY_INFORMATION = 0x0400
+        PROCESS_VM_READ           = 0x0010
+        LIST_MODULES_ALL          = 0x03
+        kernel32 = ctypes.windll.kernel32
+        psapi    = ctypes.windll.psapi
+        h = kernel32.OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ,
+                                 False, pid)
+        if not h:
+            return None
+        try:
+            arr    = (ctypes.c_void_p * 1024)()
+            needed = ctypes.c_ulong()
+            if not psapi.EnumProcessModulesEx(h, arr, ctypes.sizeof(arr),
+                                              ctypes.byref(needed),
+                                              LIST_MODULES_ALL):
+                return None
+            count = min(needed.value // ctypes.sizeof(ctypes.c_void_p), 1024)
+            buf = ctypes.create_unicode_buffer(260)
+            for i in range(count):
+                # 모듈 베이스 주소는 고주소(0x7ff…)라 기본 C int 변환 시
+                # 오버플로가 난다. 반드시 c_void_p로 감싸 포인터로 전달할 것.
+                if psapi.GetModuleFileNameExW(h, ctypes.c_void_p(arr[i]), buf, 260):
+                    product = ezlab_product_of(buf.value)
+                    if product:
+                        return product
+        except Exception:
+            return None
+        finally:
+            kernel32.CloseHandle(h)
+        return None
+
+    @staticmethod
     def _ezlab_windows():
-        """현재 세션의 가시 최상위 창 중 이지랩 프로세스 소유: [(hwnd, pid, exe)].
-        모니터 자신은 제외한다 (자기 창 리빌드 중 오탐 방지)."""
+        """현재 세션의 가시 최상위 창 중 이지랩 관련 프로세스 소유:
+        [(hwnd, pid, exe, app_label)]. 이지랩 exe면 그 표시명을, 호스트
+        프로세스(dllhost 등)가 이지랩 셸 확장을 대신 실행 중이면 그 제품의
+        '(셸 확장)' 라벨을 붙인다. 모니터 자신은 제외(자기 창 리빌드 중 오탐 방지).
+        모듈 열거는 '가시 창을 가진' 호스트에만 일어나 오버헤드가 미미하다."""
         user32, kernel32 = ctypes.windll.user32, ctypes.windll.kernel32
         found = []
 
@@ -865,9 +948,14 @@ class HangWatcher:
                 size = ctypes.c_ulong(1024)
                 if kernel32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(size)):
                     exe = os.path.basename(buf.value)
-                    if (exe.lower() in EZLAB_APPS
-                            and exe.lower() != 'ezlabqamonitor.exe'):
-                        found.append((hwnd, pid.value, exe))
+                    low = exe.lower()
+                    if low in EZLAB_APPS and low != 'ezlabqamonitor.exe':
+                        found.append((hwnd, pid.value, exe, EZLAB_APPS[low]))
+                    elif low in SHELL_HOST_PROCESSES:
+                        product = HangWatcher._ezlab_shell_product(pid.value)
+                        if product:
+                            found.append((hwnd, pid.value, exe,
+                                          f'{product} (셸 확장)'))
             finally:
                 kernel32.CloseHandle(h)
             return True
@@ -893,13 +981,13 @@ class HangWatcher:
         # pid 단위로 집계: 한 프로세스가 창을 여러 개 가질 수 있고(콘솔/보조
         # 창은 응답하는데 메인 창만 멈추는 경우), 창 단위로 판정하면 정상
         # 창이 무응답 상태를 매번 리셋해 감지가 영영 안 된다.
-        procs: dict = {}   # pid -> (exe, 하나라도 무응답인가)
-        for hwnd, pid, exe in self._ezlab_windows():
+        procs: dict = {}   # pid -> (exe, app_label, 하나라도 무응답인가)
+        for hwnd, pid, exe, app_label in self._ezlab_windows():
             hung = self._is_hung(hwnd)
-            _, prev_hung = procs.get(pid, (exe, False))
-            procs[pid] = (exe, hung or prev_hung)
+            _, _, prev_hung = procs.get(pid, (exe, app_label, False))
+            procs[pid] = (exe, app_label, hung or prev_hung)
 
-        for pid, (exe, hung) in procs.items():
+        for pid, (exe, app_label, hung) in procs.items():
             if not hung:
                 self._hung_since.pop(pid, None)
                 continue
@@ -909,7 +997,7 @@ class HangWatcher:
                 self._dumped.add(pid)
                 ok = self._write_dump(pid, exe)
                 try:
-                    self._on_hang(exe, pid, hung_secs, ok)
+                    self._on_hang(exe, pid, hung_secs, ok, app_label)
                 except Exception:
                     pass
         # 종료된 프로세스의 상태 정리 (pid 재사용 대비)
@@ -2437,7 +2525,8 @@ class QAMonitor:
         if snapshot is not None:
             save_history(snapshot)
 
-    def _on_hang(self, exe: str, pid: int, hung_secs: float, dump_ok: bool):
+    def _on_hang(self, exe: str, pid: int, hung_secs: float, dump_ok: bool,
+                 app_label: str = ''):
         """HangWatcher 콜백: 응답 없음을 실시간으로 잡았을 때. 프로세스가 아직
         살아 있으므로 1002보다 먼저 이력에 남고, 캡처된 덤프는 DumpWatcher가
         분석해 스택을 이 이력에 자동 첨부한다."""
@@ -2453,10 +2542,14 @@ class QAMonitor:
             f'{sep}\n'
             'Windows가 AppHang(1002)으로 기록하기 전, 프로세스 생존 중에 선제\n'
             '감지한 이벤트입니다. 이후 사용자가 창을 닫으면 별도의 "응답 없음\n'
-            '(Hang)" 이력이 추가로 남을 수 있습니다. 덤프가 캡처된 경우 관리\n'
-            '코드 스택은 잠시 후 자동 분석되어 이 상세에 첨부됩니다.'
+            '(Hang)" 이력이 추가로 남을 수 있습니다. 덤프가 캡처된 경우, 관리\n'
+            '(.NET) 코드라면 스택이 잠시 후 자동 분석되어 이 상세에 첨부되고,\n'
+            '네이티브 모듈(예: 셸 확장 DLL)이면 보고서 ZIP으로 덤프를 내려받아\n'
+            '직접 분석하세요.'
         )
-        ev = CrashEvent(ts, self._watcher._resolve(exe), exe,
+        # app_label이 있으면(예: 'ezZip (셸 확장)') 그대로 쓰고, 없으면 exe 해석.
+        # process는 덤프 파일명(<exe>.<pid>.dmp) 매칭에 쓰이므로 exe 원본을 유지.
+        ev = CrashEvent(ts, app_label or self._watcher._resolve(exe), exe,
                         '응답 없음 감지 (실시간)',
                         f'UI 응답 없음 {int(hung_secs)}초 경과 — 종료 전 덤프 '
                         f'{"캡처 완료" if dump_ok else "캡처 실패"}', detail)
