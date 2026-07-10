@@ -10,6 +10,7 @@ import csv
 import gc
 import json
 import queue
+import shutil
 import msvcrt
 import zipfile
 import threading
@@ -67,6 +68,18 @@ DUMP_DIR          = Path(os.environ.get('ProgramData', r'C:\ProgramData')) / 'ez
 DUMP_ANALYZER_EXE = BASE_DIR / 'DumpAnalyzer.exe'
 MAX_DUMP_FILES    = 20  # 오래된 덤프는 자동 삭제, 최근 N개만 보관
 
+# 전체 메모리 덤프는 개당 수백 MB~GB까지 커질 수 있어 개수 제한만으로는
+# 디스크가 마른다. 총용량·보관기간 상한을 함께 둬서 오래되거나 폭주한 덤프를
+# 정리한다 (개수·용량·기간 중 하나라도 초과하면 오래된 것부터 삭제).
+MAX_DUMP_TOTAL_MB = 2048   # 덤프 폴더 총용량 상한(약 2GB)
+MAX_DUMP_AGE_DAYS = 14     # 이 기간보다 오래된 덤프는 자동 삭제
+
+# 덤프 분석 신뢰성: WER가 파일을 다 쓰기 전에 집으면 분석이 실패한다.
+# 크기가 연속으로 같은지 확인해 '쓰기 완료'를 판정하고, 일시적 분석 실패는
+# 몇 번 재시도한 뒤 포기한다(영구 실패한 덤프로 매 폴링 CPU를 태우지 않게).
+DUMP_SIZE_STABLE_POLLS  = 2   # 크기가 이 횟수만큼 연속 동일하면 완성으로 간주
+DUMP_ANALYZE_MAX_RETRY  = 3   # 일시적 분석 실패 재시도 한도(초과 시 포기)
+
 # 이미 분석한 덤프 파일명 목록. 영속시키지 않으면 재시작할 때마다 남아있는
 # 덤프 전부를 다시 분석한다 (개당 최대 90초 — 시작 직후 CPU 낭비).
 ANALYZED_DUMPS_FILE = DATA_DIR / 'analyzed_dumps.json'
@@ -84,6 +97,29 @@ def _read_version() -> str:
 
 
 APP_VERSION = _read_version()
+
+
+def _configure_win32_prototypes():
+    """ctypes 기본 규약은 인자를 32비트 c_int로 넘기므로 Win64에서 HWND가 잘리고,
+    특히 SendMessageTimeoutW의 lpdwResult는 PDWORD_PTR(8바이트)인데 기본 처리로는
+    4바이트만 잡혀 API가 버퍼를 넘겨 쓴다(스택/힙 오버런). 사용하는 함수의
+    시그니처를 명시해 잘림과 오버런을 원천 차단한다. 한 번만 설정하면 된다."""
+    try:
+        u = ctypes.windll.user32
+        u.IsHungAppWindow.argtypes = [ctypes.c_void_p]           # HWND
+        u.IsHungAppWindow.restype  = ctypes.c_bool               # BOOL
+        u.SendMessageTimeoutW.argtypes = [
+            ctypes.c_void_p,    # HWND    hwnd
+            ctypes.c_uint,      # UINT    msg
+            ctypes.c_size_t,    # WPARAM  wParam
+            ctypes.c_ssize_t,   # LPARAM  lParam
+            ctypes.c_uint,      # UINT    flags (SMTO_*)
+            ctypes.c_uint,      # UINT    timeout(ms)
+            ctypes.c_void_p,    # PDWORD_PTR lpdwResult (None=NULL, 결과 미사용)
+        ]
+        u.SendMessageTimeoutW.restype = ctypes.c_ssize_t         # LRESULT
+    except Exception:
+        pass
 
 
 def _enable_dpi_awareness():
@@ -261,6 +297,10 @@ POLL_SECONDS = 3
 POLL_FAIL_ALERT_THRESHOLD = 5    # 연속 실패 5회(약 15초) 시 최초 경고
 POLL_FAIL_ALERT_REPEAT    = 100  # 이후에도 계속 실패하면 100회(약 5분)마다 재경고
 
+# 같은 오류(프로세스+유형)가 짧은 시간에 반복될 때 토스트가 폭주하지 않도록,
+# 이 구간 안의 반복은 토스트를 억제하고 다음 토스트에 반복 횟수를 합쳐 알린다.
+TOAST_SUPPRESS_SEC = 60
+
 # ── 라이트 테마 색상 ─────────────────────────────────────────────
 BG      = '#F4F6F8'   # 배경
 SURFACE = '#FFFFFF'   # 표면
@@ -340,13 +380,85 @@ INSTALL_HISTORY_FILE = DATA_DIR / 'install_history.json'
 MAX_HISTORY_ENTRIES = 500  # 오래된 항목은 자동으로 정리하고 최근 N개만 보관
 
 
+# 크래시·멈춤·덤프분석·UI 삭제가 각각 다른 스레드에서 저장을 호출할 수 있다.
+# 고정 tmp 이름을 락 없이 쓰면 두 저장이 겹칠 때 tmp가 찢기거나 os.replace가
+# 충돌해 이력이 조용히 사라질 수 있다. 모든 저장을 이 락으로 직렬화한다.
+_SAVE_LOCK = threading.Lock()
+
+
 def _atomic_write_json(path: Path, data) -> None:
     # 쓰는 도중 강제 종료/크래시가 나도 기존 파일이 손상되지 않도록
-    # 임시 파일에 먼저 쓰고 os.replace()로 통째로 교체한다.
-    tmp = path.with_name(path.name + '.tmp')
-    with open(tmp, 'w', encoding='utf-8') as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, path)
+    # 임시 파일에 먼저 쓰고 os.replace()로 통째로 교체한다. 동시 저장으로 인한
+    # tmp 훼손/replace 충돌을 막기 위해 저장 전체를 _SAVE_LOCK으로 직렬화한다.
+    with _SAVE_LOCK:
+        tmp = path.with_name(path.name + '.tmp')
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)
+
+
+def _safe_size(p: Path) -> int:
+    try:
+        return p.stat().st_size
+    except OSError:
+        return 0
+
+
+def _safe_mtime(p: Path) -> float:
+    try:
+        return p.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+# ── 자가 상태 점검 ────────────────────────────────────────────────
+WER_LOCALDUMPS_KEY = (r'SOFTWARE\Microsoft\Windows\Windows Error Reporting'
+                      r'\LocalDumps')
+
+
+def _health_wer() -> tuple:
+    """이지랩 앱들의 WER LocalDumps 등록 상태. 인스톨러가 네이티브 64비트 뷰에
+    쓰므로 KEY_WOW64_64KEY로 같은 뷰를 읽는다."""
+    exes = [n for n in EZLAB_APPS if n.endswith('.exe')]
+    ok = 0
+    for exe in exes:
+        try:
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                                WER_LOCALDUMPS_KEY + '\\' + exe, 0,
+                                winreg.KEY_READ | winreg.KEY_WOW64_64KEY) as k:
+                winreg.QueryValueEx(k, 'DumpFolder')
+            ok += 1
+        except OSError:
+            pass
+    return ok == len(exes), f'{ok}/{len(exes)} 앱 등록됨'
+
+
+def _health_dump_dir() -> tuple:
+    """덤프 폴더 존재 + 실제 쓰기 가능 여부(권한 좁힌 뒤 회귀 확인용)."""
+    try:
+        DUMP_DIR.mkdir(parents=True, exist_ok=True)
+        probe = DUMP_DIR / '.write_test'
+        probe.write_text('x', encoding='utf-8')
+        probe.unlink()
+        return True, '쓰기 가능'
+    except Exception as e:
+        return False, f'쓰기 불가: {e}'
+
+
+def _health_disk() -> tuple:
+    """덤프가 쌓이는 드라이브의 남은 용량. 전체 메모리 덤프는 커서 1GB 미만이면 주의."""
+    try:
+        anchor = DUMP_DIR if DUMP_DIR.exists() else Path(DUMP_DIR.anchor or 'C:\\')
+        free_gb = shutil.disk_usage(str(anchor)).free / (1024 ** 3)
+        return free_gb >= 1.0, f'{free_gb:.1f} GB 남음'
+    except Exception as e:
+        return False, f'확인 실패: {e}'
+
+
+def _health_analyzer() -> tuple:
+    if DUMP_ANALYZER_EXE.exists():
+        return True, '있음 (관리코드 스택 자동분석 가능)'
+    return False, '없음 — 스택 자동분석 불가'
 
 
 def load_history() -> List[CrashEvent]:
@@ -969,11 +1081,11 @@ class HangWatcher:
         if user32.IsHungAppWindow(hwnd):
             return True
         # IsHungAppWindow는 사용자 입력 시도가 있어야 갱신되는 경우가 있어
-        # WM_NULL 응답 시간으로도 능동 확인한다 (2초 무응답 = 멈춤)
+        # WM_NULL 응답 시간으로도 능동 확인한다 (2초 무응답 = 멈춤).
+        # 결과값(lpdwResult)은 쓰지 않으므로 NULL로 넘긴다 — 시그니처는
+        # _configure_win32_prototypes()에서 PDWORD_PTR로 명시해 오버런을 막았다.
         SMTO_ABORTIFHUNG = 0x0002
-        res = ctypes.c_ulong()
-        ok = user32.SendMessageTimeoutW(hwnd, 0, 0, 0,
-                                        SMTO_ABORTIFHUNG, 2000, ctypes.byref(res))
+        ok = user32.SendMessageTimeoutW(hwnd, 0, 0, 0, SMTO_ABORTIFHUNG, 2000, None)
         return not ok
 
     def _poll(self):
@@ -1042,7 +1154,11 @@ class DumpWatcher:
 
     def __init__(self, on_stack_trace: Callable[[str, datetime, str], None]):
         self._on_stack_trace = on_stack_trace
-        self._seen: set = self._load_seen()
+        self._seen: set = self._load_seen()   # 분석 종료(성공/영구실패)한 덤프명
+        # name -> (마지막 관측 크기, 연속 동일 횟수). WER가 다 쓰기 전에 집는 걸 방지.
+        self._sizes: dict = {}
+        # name -> 일시적 분석 실패 누적 횟수 (한도 초과 시 seen으로 보내 포기).
+        self._fails: dict = {}
         self._stop = threading.Event()
 
     @staticmethod
@@ -1081,30 +1197,100 @@ class DumpWatcher:
         for dmp in dumps:
             if dmp.name in self._seen:
                 continue
-            self._seen.add(dmp.name)
-            changed = True
-            self._analyze(dmp)
-
-        # 보관 개수 제한: 오래된 것부터 정리
-        dumps = sorted(DUMP_DIR.glob('*.dmp'), key=lambda p: p.stat().st_mtime)
-        for old in dumps[:-MAX_DUMP_FILES] if len(dumps) > MAX_DUMP_FILES else []:
             try:
-                old.unlink()
-            except Exception:
-                pass
+                size = dmp.stat().st_size
+            except OSError:
+                continue   # 방금 사라진 파일(다른 곳에서 정리됨) → 건너뜀
 
-        # 삭제된 덤프의 이름은 상태에서도 정리해 파일이 무한히 크지 않게 한다
+            # 크기 안정성 확인: WER가 아직 쓰는 중이면 크기가 계속 변한다.
+            # 연속으로 같은 크기가 DUMP_SIZE_STABLE_POLLS번 관측돼야 완성으로 본다.
+            prev_size, stable = self._sizes.get(dmp.name, (None, 0))
+            if size == 0 or prev_size != size:
+                self._sizes[dmp.name] = (size, 1)
+                continue
+            stable += 1
+            self._sizes[dmp.name] = (size, stable)
+            if stable < DUMP_SIZE_STABLE_POLLS:
+                continue
+
+            # 여기까지 오면 완성된 덤프. 분석 결과에 따라 종료/재시도를 결정한다.
+            status = self._analyze(dmp)
+            if status in ('ok', 'empty'):
+                # 성공 또는 '분석할 관리코드 없음'(네이티브 크래시) → 종료 확정
+                self._seen.add(dmp.name)
+                self._fails.pop(dmp.name, None)
+                changed = True
+            else:  # 'transient': 분석기 타임아웃/오류/빈 출력 → 재시도 예산 차감
+                self._fails[dmp.name] = self._fails.get(dmp.name, 0) + 1
+                if self._fails[dmp.name] >= DUMP_ANALYZE_MAX_RETRY:
+                    self._seen.add(dmp.name)   # 반복 실패 → 포기(폴링 낭비 방지)
+                    self._fails.pop(dmp.name, None)
+                    changed = True
+
+        self._cleanup_dumps()
+
+        # 삭제된 덤프의 이름은 추적 상태에서도 정리해 파일/메모리가 무한히 크지 않게 한다
         existing = {p.name for p in DUMP_DIR.glob('*.dmp')}
         pruned = self._seen & existing
         if pruned != self._seen:
             self._seen = pruned
             changed = True
+        self._sizes = {n: v for n, v in self._sizes.items() if n in existing}
+        self._fails = {n: v for n, v in self._fails.items() if n in existing}
         if changed:
             self._save_seen()
 
-    def _analyze(self, dmp_path: Path):
-        if not DUMP_ANALYZER_EXE.exists():
+    @staticmethod
+    def _cleanup_dumps():
+        """보관 정책: 개수·총용량·보관기간 상한 중 하나라도 넘으면 오래된 것부터
+        삭제한다. 전체 메모리 덤프는 개당 수백 MB라 개수만으론 디스크가 마른다."""
+        try:
+            dumps = sorted(DUMP_DIR.glob('*.dmp'), key=lambda p: p.stat().st_mtime)
+        except OSError:
             return
+
+        def _drop(paths):
+            for p in paths:
+                try:
+                    p.unlink()
+                except OSError:
+                    pass
+
+        # 1) 보관기간 초과분 삭제
+        cutoff = datetime.now().timestamp() - MAX_DUMP_AGE_DAYS * 86400
+        aged = [p for p in dumps if _safe_mtime(p) < cutoff]
+        if aged:
+            _drop(aged)
+            dumps = [p for p in dumps if p not in aged]
+
+        # 2) 개수 초과분 삭제 (오래된 것부터)
+        if len(dumps) > MAX_DUMP_FILES:
+            _drop(dumps[:-MAX_DUMP_FILES])
+            dumps = dumps[-MAX_DUMP_FILES:]
+
+        # 3) 총용량 초과 시 상한 이하가 될 때까지 오래된 것부터 삭제.
+        #    단, 가장 최신 덤프 1개는 그 하나가 상한을 넘더라도 남긴다 — 방금 난
+        #    크래시의 유일한 증거를 용량 정책이 곧바로 지워버리면 QA에 최악이다.
+        budget = MAX_DUMP_TOTAL_MB * 1024 * 1024
+        sizes = [(p, _safe_size(p)) for p in dumps]   # 오래된 것 → 최신 순
+        total = sum(s for _, s in sizes)
+        i = 0
+        while total > budget and i < len(sizes) - 1:   # len-1: 최신 1개는 보존
+            p, s = sizes[i]
+            try:
+                p.unlink()
+                total -= s
+            except OSError:
+                pass
+            i += 1
+
+    def _analyze(self, dmp_path: Path) -> str:
+        """덤프 1개를 분석한다. 반환값으로 폴러가 종료/재시도를 판단한다:
+          'ok'        — 관리코드 스택을 뽑아 콜백까지 완료(종료 확정)
+          'empty'     — CLR 없음/관리 스레드 없음 = 네이티브 크래시(재분석 불필요)
+          'transient' — 분석기 없음·타임아웃·오류·빈 출력(재시도 대상)"""
+        if not DUMP_ANALYZER_EXE.exists():
+            return 'transient'   # 분석기가 아직 배포 전일 수 있음 → 다음에 재시도
         # WER 기본 파일명 형식: <프로세스exe>.<PID>.dmp
         proc_name = dmp_path.stem.rsplit('.', 1)[0]
         try:
@@ -1115,11 +1301,16 @@ class DumpWatcher:
             )
             text = (result.stdout or '').strip()
         except Exception:
-            return
-        if not text or text.startswith(('NO_CLR_RUNTIME_FOUND', 'NO_MANAGED_THREAD_FOUND', 'ANALYZER_ERROR')):
-            return
+            return 'transient'   # 타임아웃/실행 실패 → 재시도
+        # 관리코드 런타임/스레드가 없는 건 확정적 결과(네이티브 크래시)라 재시도 무의미
+        if text.startswith(('NO_CLR_RUNTIME_FOUND', 'NO_MANAGED_THREAD_FOUND')):
+            return 'empty'
+        # 분석기 내부 오류·빈 출력은 일시적일 수 있으니 재시도 대상
+        if not text or text.startswith('ANALYZER_ERROR'):
+            return 'transient'
         ts = datetime.fromtimestamp(dmp_path.stat().st_mtime)
         self._on_stack_trace(proc_name, ts, text)
+        return 'ok'
 
 
 # ── 유틸 ─────────────────────────────────────────────────────────
@@ -1158,6 +1349,8 @@ class HistoryWindow:
         self._count_var: Optional[tk.StringVar] = None
         self._count_label: Optional[tk.Label] = None
         self._install_frame: Optional[tk.Frame] = None  # 설치 이력 테이블 컨테이너
+        self._group_view:  Optional[tk.Frame] = None     # '반복 오류' 탭 프레임
+        self._group_frame: Optional[tk.Frame] = None     # 그룹 카드 컨테이너
         # 다른 스레드가 Tk API를 직접 부르면 Tcl이 패닉으로 프로세스를 죽일 수
         # 있다(tcl86t.dll 0x80000003). 외부 스레드는 이 큐에만 넣고, GUI
         # 스레드가 after 루프로 꺼내 반영한다.
@@ -1183,6 +1376,8 @@ class HistoryWindow:
         self._master.insert(0, ev)
         self._refresh_filter_options()
         self._apply_filter()
+        if getattr(self, '_active_tab', None) == 'group' and self._group_frame:
+            self._rebuild_group_table()
 
     def _on_new_install(self, ev: InstallEvent):
         self._install_history.insert(0, ev)
@@ -1307,8 +1502,10 @@ class HistoryWindow:
         self._build_header(root)
         self._build_tab_switcher(root)
         self._crash_frame  = tk.Frame(root, bg=BG)
+        self._group_view   = tk.Frame(root, bg=BG)
         self._install_view = tk.Frame(root, bg=BG)
         self._build_body(self._crash_frame)
+        self._build_group_view(self._group_view)
         self._build_install_view(self._install_view)
         self._crash_frame.pack(fill=tk.BOTH, expand=True)
         root.bind_all('<MouseWheel>', self._on_mousewheel)
@@ -1372,19 +1569,21 @@ class HistoryWindow:
 
         def switch(name):
             self._active_tab = name
-            if name == 'crash':
-                self._crash_frame.pack(fill=tk.BOTH, expand=True)
-                self._install_view.pack_forget()
-            else:
-                self._install_view.pack(fill=tk.BOTH, expand=True)
-                self._crash_frame.pack_forget()
+            frames = {'crash': self._crash_frame, 'group': self._group_view,
+                      'install': self._install_view}
+            for f in frames.values():
+                f.pack_forget()
+            frames[name].pack(fill=tk.BOTH, expand=True)
+            if name == 'group':
+                self._rebuild_group_table()
             for n, (lbl, ind) in self._tab_btns.items():
                 active = n == name
                 lbl.config(fg=BLUE if active else MUTED,
                            font=('Segoe UI', 10, 'bold' if active else 'normal'))
                 ind.config(bg=BLUE if active else SURFACE)
 
-        for key, label in [('crash', '크래시 이력'), ('install', '설치 / 삭제 이력')]:
+        for key, label in [('crash', '크래시 이력'), ('group', '반복 오류'),
+                           ('install', '설치 / 삭제 이력')]:
             active = key == 'crash'
             cell = tk.Frame(bar, bg=SURFACE, cursor='hand2')
             cell.pack(side=tk.LEFT)
@@ -1409,6 +1608,95 @@ class HistoryWindow:
         tk.Frame(parent, bg=BORDER, height=1).pack(fill=tk.X)
 
     # ── 설치 이력 뷰 ──
+    # ── 반복 오류 그룹 뷰 ──
+    def _compute_groups(self) -> list:
+        """앱·프로세스·오류유형이 같은 크래시를 묶어 발생 횟수·최초/최종·오늘 횟수를
+        집계한다. 반복 크래시를 한눈에 보기 위한 요약."""
+        src = self._master if getattr(self, '_master', None) is not None else self._history
+        today = datetime.now().date()
+        groups: dict = {}
+        for ev in src or []:
+            key = (ev.app_name, ev.process, ev.error_type)
+            g = groups.get(key)
+            if g is None:
+                g = {'app': ev.app_name, 'process': ev.process,
+                     'error_type': ev.error_type, 'count': 0,
+                     'first': ev.timestamp, 'last': ev.timestamp, 'today': 0}
+                groups[key] = g
+            g['count'] += 1
+            if ev.timestamp < g['first']:
+                g['first'] = ev.timestamp
+            if ev.timestamp > g['last']:
+                g['last'] = ev.timestamp
+            if ev.timestamp.date() == today:
+                g['today'] += 1
+        return sorted(groups.values(), key=lambda x: (x['count'], x['last']),
+                      reverse=True)
+
+    def _build_group_view(self, parent: tk.Frame):
+        hdr = tk.Frame(parent, bg=SURFACE, pady=10, padx=16)
+        hdr.pack(fill=tk.X)
+        tk.Label(hdr, text='반복 오류 그룹', font=('Segoe UI', 10, 'bold'),
+                 bg=SURFACE, fg=FG).pack(side=tk.LEFT)
+        tk.Label(hdr, text='앱 · 프로세스 · 오류 유형이 같은 크래시를 묶어 발생 횟수와 기간을 보여줍니다',
+                 font=('Segoe UI', 9), bg=SURFACE, fg=MUTED).pack(side=tk.LEFT, padx=12)
+        tk.Frame(parent, bg=BORDER, height=1).pack(fill=tk.X)
+
+        canvas = tk.Canvas(parent, bg=BG, highlightthickness=0)
+        sb = ttk.Scrollbar(parent, orient=tk.VERTICAL, command=canvas.yview)
+        canvas.configure(yscrollcommand=sb.set)
+        self._group_frame = tk.Frame(canvas, bg=BG)
+        _cid = canvas.create_window((0, 0), window=self._group_frame, anchor='nw')
+
+        def _on_resize(e):
+            canvas.configure(scrollregion=canvas.bbox('all'))
+            canvas.itemconfig(_cid, width=canvas.winfo_width())
+
+        self._group_canvas = canvas
+        self._group_frame.bind('<Configure>', _on_resize)
+        canvas.bind('<Configure>', lambda e: canvas.itemconfig(_cid, width=e.width))
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self._rebuild_group_table()
+
+    def _rebuild_group_table(self):
+        if not self._group_frame:
+            return
+        for w in self._group_frame.winfo_children():
+            w.destroy()
+
+        groups = self._compute_groups()
+        if not groups:
+            tk.Label(self._group_frame, text='기록된 크래시가 없습니다.',
+                     font=('Segoe UI', 10), bg=BG, fg=MUTED).pack(pady=40)
+            return
+
+        for g in groups:
+            card = tk.Frame(self._group_frame, bg=PANEL)
+            card.pack(fill=tk.X, padx=16, pady=(12, 0))
+            inner = tk.Frame(card, bg=PANEL, padx=14, pady=12)
+            inner.pack(fill=tk.X)
+
+            top = tk.Frame(inner, bg=PANEL)
+            top.pack(fill=tk.X)
+            tk.Label(top, text=g['app'], font=('Segoe UI', 11, 'bold'),
+                     bg=PANEL, fg=FG).pack(side=tk.LEFT)
+            # 반복이 잦을수록(5회 이상) 붉게 강조
+            hot = g['count'] >= 5
+            tk.Label(top, text=f' 총 {g["count"]}회 ',
+                     bg=RED_BG if hot else BLUE_BG, fg=RED if hot else BLUE,
+                     font=('Segoe UI', 9, 'bold')).pack(side=tk.RIGHT)
+            if g['today']:
+                tk.Label(top, text=f' 오늘 {g["today"]}회 ', bg=RED_BG, fg=RED,
+                         font=('Segoe UI', 9, 'bold')).pack(side=tk.RIGHT, padx=(0, 6))
+
+            tk.Label(inner, text=f'{g["error_type"]}  ·  {g["process"]}',
+                     font=('Segoe UI', 9), bg=PANEL, fg=SUBTLE).pack(anchor='w', pady=(4, 0))
+            span = (f'최초 {g["first"].strftime("%Y-%m-%d %H:%M")}   ·   '
+                    f'최종 {g["last"].strftime("%Y-%m-%d %H:%M")}')
+            tk.Label(inner, text=span, font=('Segoe UI', 9),
+                     bg=PANEL, fg=MUTED).pack(anchor='w', pady=(2, 0))
+
     def _build_install_view(self, parent: tk.Frame):
         # 헤더
         hdr = tk.Frame(parent, bg=SURFACE, pady=10, padx=16)
@@ -2342,6 +2630,21 @@ class HistoryWindow:
         읽는 분석 리포트(.txt)를 한 파일로. 덤프 분석은 수십 초 걸릴 수 있어
         워커 스레드에서 수행하고 버튼에 진행 상태를 표시한다."""
         proc_base = ev.process.rsplit('.', 1)[0] or 'unknown'
+        dumps = self._matching_dumps(ev)
+
+        # 전체 메모리 덤프에는 토큰·문서 내용·개인정보 등 민감정보가 담길 수 있다.
+        # 덤프를 포함해 외부로 내보내기 전에 명시적으로 경고하고 동의를 받는다.
+        if dumps and not messagebox.askyesno(
+                '민감정보 포함 경고',
+                f'이 ZIP에는 전체 메모리 덤프 {len(dumps)}개가 포함됩니다.\n\n'
+                '메모리 덤프에는 로그인 토큰·문서 내용·개인정보 등\n'
+                '민감한 데이터가 그대로 담길 수 있습니다.\n'
+                '신뢰할 수 있는 개발자에게만 전달하세요.\n\n'
+                '덤프를 포함해 계속 저장할까요?\n'
+                '("아니오"를 누르면 덤프 없이 보고서만 저장합니다.)',
+                icon='warning', default='no'):
+            dumps = []   # 사용자가 거부하면 덤프 제외하고 보고서만 내보낸다
+
         path = filedialog.asksaveasfilename(
             defaultextension='.zip',
             filetypes=[('ZIP 파일', '*.zip')],
@@ -2349,7 +2652,6 @@ class HistoryWindow:
                          f'{ev.timestamp.strftime("%Y%m%d_%H%M%S")}.zip'))
         if not path:
             return
-        dumps = self._matching_dumps(ev)
 
         # 진행 표시 + 중복 클릭 방지
         self._zip_btn.config(state=tk.DISABLED,
@@ -2397,6 +2699,133 @@ class HistoryWindow:
         threading.Thread(target=_worker, daemon=True).start()
 
 
+# ── 자가 상태 점검 창 ─────────────────────────────────────────────
+class StatusWindow:
+    """모니터가 제대로 감시하고 있는지 한 화면에서 확인한다: WER 등록,
+    덤프 폴더 쓰기 권한, 디스크 여유, DumpAnalyzer 존재, 마지막 정상 폴링."""
+
+    def __init__(self, get_runtime: Callable, on_close: Callable = None):
+        # get_runtime(): (last_checked: Optional[datetime], consec_fail: int) 반환
+        self._get_runtime = get_runtime
+        self._on_close = on_close
+        self._root: Optional[tk.Tk] = None
+        self._body: Optional[tk.Frame] = None
+
+    def show(self):
+        # 창 구성 중 예외가 나도 반드시 이 스레드에서 Tk 참조를 정리한다
+        try:
+            self._show_inner()
+        finally:
+            self._teardown()
+
+    def _show_inner(self):
+        root = tk.Tk()
+        self._root = root
+        root.title('모니터 상태 점검')
+        root.configure(bg=BG)
+        root.geometry('480x430')
+        root.resizable(False, False)
+        try:
+            if LOGO_ICO.exists():
+                root.iconbitmap(str(LOGO_ICO))
+        except Exception:
+            pass
+
+        tk.Label(root, text='모니터 상태 점검', bg=BG, fg=FG,
+                 font=('Segoe UI', 15, 'bold')).pack(anchor='w', padx=22, pady=(20, 2))
+        tk.Label(root, text=f'ezLab QA Monitor v{APP_VERSION}', bg=BG, fg=SUBTLE,
+                 font=('Segoe UI', 9)).pack(anchor='w', padx=22, pady=(0, 14))
+
+        self._body = tk.Frame(root, bg=BG)
+        self._body.pack(fill=tk.BOTH, expand=True, padx=22)
+        self._render()
+
+        bar = tk.Frame(root, bg=BG)
+        bar.pack(fill=tk.X, padx=22, pady=16)
+        tk.Button(bar, text='다시 검사', command=self._render,
+                  font=('Segoe UI', 9), bg=SURFACE, fg=FG, relief=tk.FLAT,
+                  activebackground=OVERLAY, cursor='hand2', padx=14, pady=6,
+                  bd=1, highlightbackground=BORDER).pack(side=tk.LEFT)
+        tk.Button(bar, text='닫기', command=self._close,
+                  font=('Segoe UI', 9), bg=SURFACE, fg=FG, relief=tk.FLAT,
+                  activebackground=OVERLAY, cursor='hand2', padx=14, pady=6,
+                  bd=1, highlightbackground=BORDER).pack(side=tk.RIGHT)
+
+        root.protocol('WM_DELETE_WINDOW', self._close)
+        root.after(120, lambda: (root.lift(), root.focus_force()))
+        root.mainloop()
+
+    def _render(self):
+        if self._body is None:
+            return
+        for w in self._body.winfo_children():
+            w.destroy()
+
+        last_checked, consec_fail = self._get_runtime()
+        if last_checked is None:
+            poll_ok, poll_txt = False, '아직 폴링 기록 없음'
+        else:
+            age = (datetime.now() - last_checked).total_seconds()
+            poll_ok = age < max(30, POLL_SECONDS * 5) and consec_fail == 0
+            poll_txt = (f'{last_checked.strftime("%H:%M:%S")} '
+                        f'({int(age)}초 전'
+                        + (f', 연속 실패 {consec_fail}회' if consec_fail else '') + ')')
+
+        rows = [
+            ('WER 크래시 덤프 등록', *_health_wer()),
+            ('덤프 폴더 쓰기 권한',   *_health_dump_dir()),
+            ('디스크 여유 공간',      *_health_disk()),
+            ('DumpAnalyzer',          *_health_analyzer()),
+            ('마지막 정상 폴링',      poll_ok, poll_txt),
+        ]
+        for title, ok, detail in rows:
+            self._row(title, ok, detail)
+
+    def _row(self, title: str, ok: bool, detail: str):
+        card = tk.Frame(self._body, bg=SURFACE)
+        card.pack(fill=tk.X, pady=3)
+        inner = tk.Frame(card, bg=SURFACE, padx=14, pady=10)
+        inner.pack(fill=tk.X)
+
+        dot = tk.Label(inner, text=('✅' if ok else '⚠️'), bg=SURFACE,
+                       font=('Segoe UI Emoji', 12))
+        dot.pack(side=tk.LEFT, padx=(0, 10))
+        txt = tk.Frame(inner, bg=SURFACE)
+        txt.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        tk.Label(txt, text=title, bg=SURFACE, fg=FG,
+                 font=('Segoe UI', 10, 'bold')).pack(anchor='w')
+        tk.Label(txt, text=detail, bg=SURFACE, fg=GREEN if ok else ORANGE,
+                 font=('Segoe UI', 9)).pack(anchor='w')
+
+    def _close(self):
+        try:
+            if self._root is not None:
+                self._root.quit()
+        except Exception:
+            pass
+
+    def _teardown(self):
+        # HistoryWindow와 동일한 이유로, 창을 만든 스레드에서 직접 파괴하고
+        # tkinter 전역 _default_root를 비워 Tcl_AsyncDelete 패닉을 막는다.
+        if self._root is not None:
+            try:
+                self._root.destroy()
+            except Exception:
+                pass
+        try:
+            if getattr(tk, '_default_root', None) is not None:
+                tk._default_root = None
+        except Exception:
+            pass
+        self._root = None
+        self._body = None
+        if self._on_close:
+            try:
+                self._on_close()
+            except Exception:
+                pass
+
+
 # ── 메인 앱 ──────────────────────────────────────────────────────
 class QAMonitor:
     def __init__(self):
@@ -2420,6 +2849,9 @@ class QAMonitor:
         self._last_checked: Optional[datetime] = None
         self._consec_fail  = 0
         self._alert_showing = False
+        # 토스트 억제 상태: (process, error_type) -> (구간 시작시각, 억제된 반복 수)
+        self._toast_seen: dict = {}
+        self._status_open = False
 
     def run(self):
         self._watcher.start()
@@ -2428,6 +2860,7 @@ class QAMonitor:
 
         menu = pystray.Menu(
             pystray.MenuItem('크래시 이력 보기', self._show_history, default=True),
+            pystray.MenuItem('모니터 상태 점검', self._show_status),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem('종료', self._quit),
         )
@@ -2563,6 +2996,10 @@ class QAMonitor:
                         and abs((ev.timestamp - wts).total_seconds()) <= WER_CORRELATE_SEC):
                     self._append_wer_line(ev, wline)
             self._history.append(ev)
+            # 파일뿐 아니라 실행 중 리스트에도 같은 상한을 적용한다. 안 그러면
+            # 장시간 실행 시 self._history가 무한히 커진다(저장은 잘라도 메모리는 누적).
+            if len(self._history) > MAX_HISTORY_ENTRIES:
+                del self._history[:len(self._history) - MAX_HISTORY_ENTRIES]
             count = len(self._history)
             win = self._open_window
             # 백필 중에는 건마다 디스크에 쓰지 않고(수백 건이면 O(n²) I/O),
@@ -2589,12 +3026,33 @@ class QAMonitor:
             self._icon.icon  = self._make_tray_icon(alert=True)
             self._icon.title = f'ezLab QA Monitor — {count}건 감지'
 
-        msg = f'{ev.app_name}  |  {ev.error_type}\n{ev.summary[:100]}'
-        self._toast('[이지랩 QA] 크래시 감지', msg, on_click=self._show_history)
+        # 토스트 억제: 같은 오류가 TOAST_SUPPRESS_SEC 안에 반복되면 토스트를 생략하고
+        # 반복 수만 누적한다. 구간이 끝난 뒤 첫 발생 때 누적분을 합쳐 한 번에 알린다.
+        # (이력·트레이 카운트는 억제와 무관하게 위에서 이미 갱신됨)
+        key = (ev.process.lower(), ev.error_type)
+        now = datetime.now()
+        fire, extra = True, 0
+        with self._lock:
+            last, cnt = self._toast_seen.get(key, (None, 0))
+            if last is not None and (now - last).total_seconds() < TOAST_SUPPRESS_SEC:
+                self._toast_seen[key] = (last, cnt + 1)   # 억제 구간 → 카운트만
+                fire = False
+            else:
+                extra = cnt                                # 직전 구간의 누적 반복 수
+                self._toast_seen[key] = (now, 0)           # 새 구간 시작
+        if fire:
+            if extra:
+                msg = (f'{ev.app_name}  |  {ev.error_type}\n'
+                       f'같은 오류 {extra + 1}회 반복  ·  최신: {ev.summary[:60]}')
+            else:
+                msg = f'{ev.app_name}  |  {ev.error_type}\n{ev.summary[:100]}'
+            self._toast('[이지랩 QA] 크래시 감지', msg, on_click=self._show_history)
 
     def _on_install(self, ev: InstallEvent):
         with self._lock:
             self._install_history.append(ev)
+            if len(self._install_history) > MAX_HISTORY_ENTRIES:
+                del self._install_history[:len(self._install_history) - MAX_HISTORY_ENTRIES]
             win = self._open_window
             snapshot = list(self._install_history)
         save_install_history(snapshot)
@@ -2659,6 +3117,22 @@ class QAMonitor:
 
         threading.Thread(target=run_window, daemon=True, name='HistoryWindow').start()
 
+    def _show_status(self, icon=None, item=None):
+        with self._lock:
+            if self._status_open:
+                return
+            self._status_open = True
+
+        def run_window():
+            win = StatusWindow(lambda: (self._last_checked, self._consec_fail))
+            try:
+                win.show()
+            finally:
+                with self._lock:
+                    self._status_open = False
+
+        threading.Thread(target=run_window, daemon=True, name='StatusWindow').start()
+
     def _on_window_open(self):
         self._alert_showing = False
         if self._icon:
@@ -2682,6 +3156,7 @@ class QAMonitor:
     def _quit(self, icon=None, item=None):
         self._watcher.stop()
         self._dump_watcher.stop()
+        self._hang_watcher.stop()
         if self._icon:
             self._icon.stop()
 
@@ -2714,6 +3189,7 @@ class QAMonitor:
 
 # ── 진입점 ───────────────────────────────────────────────────────
 if __name__ == '__main__':
+    _configure_win32_prototypes()
     _enable_dpi_awareness()
     _register_aumid()
 

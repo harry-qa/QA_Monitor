@@ -33,9 +33,10 @@ Name: "startup";     Description: "Windows 시작 시 자동 실행";  GroupDesc
 Source: "dist\{#AppExeName}"; DestDir: "{app}"; Flags: ignoreversion
 
 [Dirs]
-; 크래시 덤프 저장 위치. 서비스 계정으로 크래시가 나도 항상 쓸 수 있도록
-; 명시적으로 모든 사용자에게 쓰기 권한을 부여한다.
-Name: "{commonappdata}\ezLab QA Monitor\Dumps"; Permissions: users-modify
+; 크래시 덤프 저장 위치. 권한은 아래 [Run]의 icacls로 명시적으로 좁힌다
+; (여기서 users-modify를 주면 모든 사용자가 남의 전체 메모리 덤프를 읽을 수
+; 있어 토큰·개인정보가 노출된다). 폴더 생성만 하고 ACL은 icacls가 확정한다.
+Name: "{commonappdata}\ezLab QA Monitor\Dumps"
 
 [Icons]
 Name: "{group}\{#AppName}";          Filename: "{app}\{#AppExeName}"
@@ -53,6 +54,18 @@ Root: HKLM; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; \
   Flags: uninsdeletevalue; Tasks: startup
 
 [Run]
+; 덤프 폴더 ACL을 명시적으로 좁힌다. 전체 메모리 덤프에는 토큰·문서·개인정보가
+; 담길 수 있으므로 '모든 사용자 읽기'를 제거하고 다음만 허용한다:
+;   Administrators(S-1-5-32-544) / LocalSystem(S-1-5-18) : 전체(F)
+;   INTERACTIVE(S-1-5-4) : 수정(M) — 로그인한 QA 사용자(모니터 + GUI 앱 WER)
+;   SERVICE(S-1-5-6)     : 쓰기/추가/통과만 — 서비스 계정 크래시도 덤프는 남기되
+;                          남의 덤프를 읽지는 못하게 read 제외
+; /inheritance:r 로 상속된 광범위 Users 권한을 끊고, 이전 버전이 남긴 '명시적'
+; Users/Everyone/AuthenticatedUsers ACE는 /remove:g로 직접 제거한다(업그레이드 시
+; /inheritance:r만으론 명시적 ACE가 남아 하드닝이 무력화됨). 그 뒤 원하는 SID만 부여.
+Filename: "{sys}\icacls.exe"; \
+  Parameters: """{commonappdata}\ezLab QA Monitor\Dumps"" /inheritance:r /remove:g ""*S-1-5-32-545"" /remove:g ""*S-1-1-0"" /remove:g ""*S-1-5-11"" /grant:r ""*S-1-5-32-544:(OI)(CI)F"" /grant:r ""*S-1-5-18:(OI)(CI)F"" /grant:r ""*S-1-5-4:(OI)(CI)M"" /grant:r ""*S-1-5-6:(OI)(CI)(WD,AD,X)"""; \
+  Flags: runhidden waituntilterminated; StatusMsg: "덤프 폴더 보안 권한 설정 중..."
 Filename: "{app}\{#AppExeName}"; Description: "지금 바로 실행"; Flags: nowait postinstall skipifsilent
 
 [Code]
