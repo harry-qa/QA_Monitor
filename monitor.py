@@ -118,6 +118,60 @@ def _configure_win32_prototypes():
             ctypes.c_void_p,    # PDWORD_PTR lpdwResult (None=NULL, 결과 미사용)
         ]
         u.SendMessageTimeoutW.restype = ctypes.c_ssize_t         # LRESULT
+        u.GetWindowThreadProcessId.argtypes = [ctypes.c_void_p,  # HWND
+                                               ctypes.c_void_p]  # LPDWORD
+        u.GetWindowThreadProcessId.restype = ctypes.c_uint       # DWORD
+        u.IsWindowVisible.argtypes = [ctypes.c_void_p]           # HWND
+        u.IsWindowVisible.restype  = ctypes.c_bool               # BOOL
+
+        # kernel32: 핸들 반환/소비 함수. Win64에서 HANDLE은 포인터(8바이트)라
+        # 기본 c_int(4바이트) 반환/전달로는 잘려 잘못된 핸들이 된다.
+        k = ctypes.windll.kernel32
+        k.OpenProcess.argtypes = [ctypes.c_uint,   # DWORD dwDesiredAccess
+                                  ctypes.c_bool,   # BOOL  bInheritHandle
+                                  ctypes.c_uint]   # DWORD dwProcessId
+        k.OpenProcess.restype  = ctypes.c_void_p                 # HANDLE
+        k.CloseHandle.argtypes = [ctypes.c_void_p]               # HANDLE
+        k.CloseHandle.restype  = ctypes.c_bool
+        k.QueryFullProcessImageNameW.argtypes = [
+            ctypes.c_void_p,    # HANDLE hProcess
+            ctypes.c_uint,      # DWORD  dwFlags
+            ctypes.c_void_p,    # LPWSTR lpExeName (출력 버퍼)
+            ctypes.c_void_p,    # PDWORD lpdwSize
+        ]
+        k.QueryFullProcessImageNameW.restype = ctypes.c_bool
+
+        # psapi: 모듈 열거. HMODULE 배열·핸들 포인터를 다루므로 동일하게 명시.
+        p = ctypes.windll.psapi
+        p.EnumProcessModulesEx.argtypes = [
+            ctypes.c_void_p,    # HANDLE   hProcess
+            ctypes.c_void_p,    # HMODULE* lphModule (배열)
+            ctypes.c_uint,      # DWORD    cb
+            ctypes.c_void_p,    # LPDWORD  lpcbNeeded
+            ctypes.c_uint,      # DWORD    dwFilterFlag
+        ]
+        p.EnumProcessModulesEx.restype = ctypes.c_bool
+        p.GetModuleFileNameExW.argtypes = [
+            ctypes.c_void_p,    # HANDLE  hProcess
+            ctypes.c_void_p,    # HMODULE hModule
+            ctypes.c_void_p,    # LPWSTR  lpFilename
+            ctypes.c_uint,      # DWORD   nSize
+        ]
+        p.GetModuleFileNameExW.restype = ctypes.c_uint           # DWORD(복사 길이)
+
+        # dbghelp: 미니덤프. hProcess·hFile(=get_osfhandle 반환, 값이 클 수 있음)이
+        # 잘리면 덤프가 실패하거나 엉뚱한 대상을 쓰므로 반드시 c_void_p로 받는다.
+        d = ctypes.windll.dbghelp
+        d.MiniDumpWriteDump.argtypes = [
+            ctypes.c_void_p,    # HANDLE hProcess
+            ctypes.c_uint,      # DWORD  ProcessId
+            ctypes.c_void_p,    # HANDLE hFile
+            ctypes.c_uint,      # MINIDUMP_TYPE DumpType
+            ctypes.c_void_p,    # PMINIDUMP_EXCEPTION_INFORMATION
+            ctypes.c_void_p,    # PMINIDUMP_USER_STREAM_INFORMATION
+            ctypes.c_void_p,    # PMINIDUMP_CALLBACK_INFORMATION
+        ]
+        d.MiniDumpWriteDump.restype = ctypes.c_bool
     except Exception:
         pass
 
@@ -414,23 +468,46 @@ def _safe_mtime(p: Path) -> float:
 # ── 자가 상태 점검 ────────────────────────────────────────────────
 WER_LOCALDUMPS_KEY = (r'SOFTWARE\Microsoft\Windows\Windows Error Reporting'
                       r'\LocalDumps')
+# 인스톨러(installer.iss Wer64RegisterOne)가 쓰는 기대값. 상태점검이 값의
+# '존재'만이 아니라 '기대값 일치'까지 봐야 잘못된 업그레이드/외부 변경을 잡는다.
+WER_DUMP_TYPE  = 2    # MiniDumpWithFullMemory (전체 메모리 덤프)
+WER_DUMP_COUNT = 10
+
+
+def _reg_val(key, name):
+    """레지스트리 값 하나를 안전하게 읽는다(없으면 None)."""
+    try:
+        val, _ = winreg.QueryValueEx(key, name)
+        return val
+    except OSError:
+        return None
 
 
 def _health_wer() -> tuple:
-    """이지랩 앱들의 WER LocalDumps 등록 상태. 인스톨러가 네이티브 64비트 뷰에
-    쓰므로 KEY_WOW64_64KEY로 같은 뷰를 읽는다."""
+    """이지랩 앱들의 WER LocalDumps 등록이 '기대값대로'인지 검증한다. 값의 존재만
+    보면 잘못된 경로/유형이 등록돼 있어도 정상으로 오판하므로, DumpFolder가 실제
+    덤프 경로인지·DumpType가 전체 메모리(2)인지·DumpCount가 설정값인지까지 본다.
+    인스톨러가 네이티브 64비트 뷰에 쓰므로 KEY_WOW64_64KEY로 같은 뷰를 읽는다."""
     exes = [n for n in EZLAB_APPS if n.endswith('.exe')]
+    want_folder = os.path.normcase(os.path.normpath(str(DUMP_DIR)))
     ok = 0
     for exe in exes:
         try:
             with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
                                 WER_LOCALDUMPS_KEY + '\\' + exe, 0,
                                 winreg.KEY_READ | winreg.KEY_WOW64_64KEY) as k:
-                winreg.QueryValueEx(k, 'DumpFolder')
-            ok += 1
+                folder = _reg_val(k, 'DumpFolder')
+                dtype  = _reg_val(k, 'DumpType')
+                dcount = _reg_val(k, 'DumpCount')
         except OSError:
-            pass
-    return ok == len(exes), f'{ok}/{len(exes)} 앱 등록됨'
+            continue
+        folder_ok = (folder is not None and
+                     os.path.normcase(os.path.normpath(str(folder))) == want_folder)
+        if folder_ok and dtype == WER_DUMP_TYPE and dcount == WER_DUMP_COUNT:
+            ok += 1
+    if ok == len(exes):
+        return True, f'{ok}/{len(exes)} 앱 정상 (경로·유형·개수 일치)'
+    return False, f'{ok}/{len(exes)} 앱 정상 — 나머지는 미등록/값 불일치'
 
 
 def _health_dump_dir() -> tuple:
@@ -1527,6 +1604,13 @@ class HistoryWindow:
                         # 경우가 있어 topmost를 잠깐 켰다 끈다
                         root.attributes('-topmost', True)
                         root.after(150, lambda: root.attributes('-topmost', False))
+                    elif kind == 'call':
+                        # 워커 스레드가 넘긴 GUI 작업(예: ZIP 저장 완료 처리)을
+                        # 이 GUI 스레드에서 실행. 하나가 실패해도 펌프는 계속.
+                        try:
+                            ev()
+                        except Exception:
+                            pass
             except queue.Empty:
                 pass
             if not self._closed:
@@ -2691,10 +2775,11 @@ class HistoryWindow:
                             analyzed += 1
             except Exception as ex:
                 err = ex
-            # Tk 위젯 조작은 GUI 스레드에서만
-            root = self._root
-            if root is not None:
-                root.after(0, lambda: _finish(err, saved, analyzed))
+            # 워커 스레드는 Tk를 직접 만지지 않는다. 완료 통지도 다른 이벤트와
+            # 똑같이 _push_q로 넘겨 GUI 스레드의 _pump가 실행하게 한다. 창이 이미
+            # 닫혔으면 _pump가 멈춰 있어 조용히 무시된다 — 파괴된 root에 after를
+            # 걸다 Tcl_AsyncDelete(0x80000003)로 프로세스가 죽던 경로를 원천 차단.
+            self._push_q.put(('call', lambda: _finish(err, saved, analyzed)))
 
         threading.Thread(target=_worker, daemon=True).start()
 
