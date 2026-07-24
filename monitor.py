@@ -61,6 +61,12 @@ HISTORY_FILE = DATA_DIR / 'crash_history.json'
 # 모니터가 꺼져 있던 동안 발생한 크래시도 재시작 시 따라잡을 수 있다.
 WATCHER_STATE_FILE = DATA_DIR / 'watcher_state.json'
 
+# 모니터가 '놓쳤을 수 있는' 상태(이벤트 로그 초기화로 인한 수집 공백, 덤프
+# 분석 반복 실패 등)를 남기는 자가 헬스 로그. QA 도구에서 가장 위험한 건
+# 조용히 멈추는 것이라, 크래시 이력만큼 중요하다.
+HEALTH_LOG_FILE     = DATA_DIR / 'monitor_health.json'
+MAX_HEALTH_ENTRIES  = 200
+
 # WER(Windows Error Reporting)이 자동 저장하는 크래시 덤프(.dmp) 위치.
 # 서비스 계정이 크래시해도 항상 같은 경로를 쓰도록 %LOCALAPPDATA%가 아니라
 # 사용자와 무관한 %ProgramData%를 쓴다 (인스톨러가 이 경로로 LocalDumps를 등록함).
@@ -394,6 +400,14 @@ class CrashEvent:
     summary:    str
     detail:     str
     level:      str = 'Error'
+    # 크래시 프로세스 PID. 덤프 파일명(<exe>.<pid>.dmp)과 정확히 대조해 스택/
+    # 덤프를 올바른 이벤트에 연결한다. 0 = 미상(이벤트에서 PID를 못 얻은 경우로,
+    # 이때는 이름+시각 근접 매칭으로 폴백). 구버전 저장본은 이 키가 없어 0이 된다.
+    pid:        int = 0
+    # 크래시 당시 앱 버전(APPCRASH insert[1]/Hang insert[1]에서 추출). 과거
+    # 크래시엔 소급 불가라 지금부터 수집해 둔다 → 이후 "버전별 품질 비교"의 기반.
+    # '' = 미상(.NET 1026·서비스·실시간 Hang 등 버전을 못 얻는 경로).
+    app_version: str = ''
 
 
 @dataclass
@@ -576,18 +590,63 @@ def save_install_history(history: List[InstallEvent]) -> None:
         pass
 
 
+# ── 모니터 자가 헬스 로그 ────────────────────────────────────────
+class HealthLog:
+    """모니터가 '놓쳤을 수 있는' 상태를 남기는 경량 로그.
+
+    이벤트 로그 초기화로 인한 수집 공백, 덤프 분석 반복 실패처럼 지금까지
+    조용히 넘어가던 신호를 기록해 상태 점검 창에서 확인할 수 있게 한다.
+    record()는 여러 감시 스레드에서 호출되므로 자체 락으로 보호하고, 저장은
+    락 안에서 수행해 동시 기록 시에도 최신 내용이 파일에 남도록 보장한다."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._entries: List[dict] = self._load()
+
+    @staticmethod
+    def _load() -> List[dict]:
+        try:
+            with open(HEALTH_LOG_FILE, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            return data[-MAX_HEALTH_ENTRIES:] if isinstance(data, list) else []
+        except Exception:
+            return []
+
+    def record(self, kind: str, message: str) -> None:
+        """헬스 이벤트 1건 기록. kind는 분류용 짧은 슬러그
+        (예: 'eventlog_reset', 'dump_analysis_failed')."""
+        entry = {'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                 'kind': kind, 'message': message}
+        with self._lock:
+            self._entries.append(entry)
+            if len(self._entries) > MAX_HEALTH_ENTRIES:
+                del self._entries[:len(self._entries) - MAX_HEALTH_ENTRIES]
+            # 저장을 락 안에서 수행 → 동시 기록이 서로의 최신 항목을 덮어쓰지 않음.
+            # 헬스 기록은 이상 상황에서만 드물게 발생하므로 락 보유 비용은 무시할 만하다.
+            try:
+                _atomic_write_json(HEALTH_LOG_FILE, list(self._entries))
+            except Exception:
+                pass
+
+    def recent(self, limit: int = 20) -> List[dict]:
+        with self._lock:
+            return list(self._entries[-limit:])
+
+
 # ── 이벤트 로그 감시 ─────────────────────────────────────────────
 class EventLogWatcher:
     def __init__(self, on_event: Callable[[CrashEvent, bool], None],
                  on_install: Callable[[InstallEvent], None] = None,
                  on_poll: Callable[[bool], None] = None,
                  on_backfill_done: Callable[[int], None] = None,
-                 on_wer: Callable[[datetime, str, str], None] = None):
+                 on_wer: Callable[[datetime, str, str], None] = None,
+                 on_health: Callable[[str, str], None] = None):
         self._on_event   = on_event
         self._on_install = on_install
         self._on_poll    = on_poll
         self._on_backfill_done = on_backfill_done
         self._on_wer     = on_wer
+        self._on_health  = on_health
         self._stop       = threading.Event()
         # log_name -> last processed RecordNumber. 이전 실행에서 저장한 상태를
         # 이어받아, 모니터가 꺼져 있던 동안의 이벤트를 첫 폴에서 따라잡는다.
@@ -682,6 +741,17 @@ class EventLogWatcher:
                     if newest is not None and newest < last_rec:
                         new_max = newest
                         to_process = []
+                        # 로그 초기화 = 그 사이 발생한 크래시를 놓쳤을 수 있음 →
+                        # 조용히 넘기지 말고 헬스 로그에 수집 공백으로 남긴다.
+                        if self._on_health:
+                            try:
+                                self._on_health(
+                                    'eventlog_reset',
+                                    f'{log_name} 이벤트 로그가 초기화되어(레코드 번호 '
+                                    f'{last_rec}→{newest}) 그 사이 발생한 이벤트를 '
+                                    f'놓쳤을 수 있습니다.')
+                            except Exception:
+                                pass
 
                     self._last_record[log_name] = new_max
                 finally:
@@ -928,8 +998,9 @@ class EventLogWatcher:
                           '.NET 비정상 종료', exc or '알 수 없는 예외', detail)
 
     def _appcrash(self, ts, msg, detail, inserts) -> Optional[CrashEvent]:
-        # inserts[0]=앱명, [3]=모듈명, [6]=예외코드, [10]=앱경로, [11]=모듈경로
+        # inserts[0]=앱명, [1]=앱버전, [3]=모듈명, [6]=예외코드, [10]=앱경로, [11]=모듈경로
         proc   = self._ins(inserts, 0)
+        ver    = self._ins(inserts, 1)
         module = self._ins(inserts, 3)
         code   = self._ins(inserts, 6)
 
@@ -938,6 +1009,11 @@ class EventLogWatcher:
             for line in msg.splitlines():
                 if 'Faulting application name:' in line:
                     proc = line.split(',')[0].split(':', 1)[-1].strip(); break
+        if not ver:
+            # "Faulting application name: foo.exe, version: 1.2.3.4, ..." 형태에서 추출
+            for line in msg.splitlines():
+                if 'Faulting application name:' in line and 'version:' in line:
+                    ver = line.split('version:', 1)[1].split(',')[0].strip(); break
         if not module:
             for line in msg.splitlines():
                 if 'Faulting module name:' in line:
@@ -954,12 +1030,14 @@ class EventLogWatcher:
 
         return CrashEvent(ts, self._resolve(proc), proc,
                           '앱 오류 (APPCRASH)',
-                          f'충돌 모듈: {module}  |  {exc_label}', detail)
+                          f'충돌 모듈: {module}  |  {exc_label}', detail,
+                          app_version=ver)
 
     def _hang(self, ts, msg, detail, inserts) -> Optional[CrashEvent]:
-        # inserts[0]=앱명, [7]=패키지명, [8]=패키지 앱 ID, [9]=Hang 유형
+        # inserts[0]=앱명, [1]=앱버전, [7]=패키지명, [8]=패키지 앱 ID, [9]=Hang 유형
         # (이벤트 1002에는 대기 시간 파라미터가 없음)
         proc      = self._ins(inserts, 0)
+        ver       = self._ins(inserts, 1)
         pkg_name  = self._ins(inserts, 7)
         pkg_id    = self._ins(inserts, 8)
         hang_type = self._ins(inserts, 9)
@@ -973,6 +1051,11 @@ class EventLogWatcher:
                         if w.lower() == 'program' and i + 1 < len(words):
                             proc = words[i + 1]; break
                     break
+
+        # 프로세스명을 못 얻으면 무엇이 멈췄는지 알 수 없어 QA에 무의미하므로
+        # 이력에 넣지 않는다(_appcrash와 동일하게 조기 반환 — 빈 프로세스 방지).
+        if not proc:
+            return None
 
         # 호스트 프로세스(dllhost 등)가 이지랩 셸 확장을 대신 실행하다 멈춘 경우:
         # 이벤트의 앱 이름은 껍데기(dllhost.exe)라, 패키지 정보로 실제 제품을
@@ -994,7 +1077,8 @@ class EventLogWatcher:
         if hang_type:
             summary += f'  |  Hang 유형: {hang_type}'
         return CrashEvent(ts, app_name, proc,
-                          '응답 없음 (Hang)', summary, detail)
+                          '응답 없음 (Hang)', summary, detail,
+                          app_version=ver)
 
     def _service(self, ts, msg, detail, inserts) -> Optional[CrashEvent]:
         # inserts[0]=서비스 이름, [1]=종료 횟수
@@ -1229,8 +1313,10 @@ class DumpWatcher:
     """WER LocalDumps가 떨어뜨린 .dmp 파일을 감시하다가 DumpAnalyzer.exe로
     관리 코드 스택 트레이스를 뽑아 콜백으로 전달한다. 오래된 덤프는 자동 정리."""
 
-    def __init__(self, on_stack_trace: Callable[[str, datetime, str], None]):
+    def __init__(self, on_stack_trace: Callable[[str, int, datetime, str], None],
+                 on_health: Callable[[str, str], None] = None):
         self._on_stack_trace = on_stack_trace
+        self._on_health = on_health
         self._seen: set = self._load_seen()   # 분석 종료(성공/영구실패)한 덤프명
         # name -> (마지막 관측 크기, 연속 동일 횟수). WER가 다 쓰기 전에 집는 걸 방지.
         self._sizes: dict = {}
@@ -1303,6 +1389,17 @@ class DumpWatcher:
                     self._seen.add(dmp.name)   # 반복 실패 → 포기(폴링 낭비 방지)
                     self._fails.pop(dmp.name, None)
                     changed = True
+                    # 덤프는 있는데 스택을 못 뽑고 포기 = 분석 기회를 놓친 상태 →
+                    # 헬스 로그에 남겨 QA가 수동 분석을 고려할 수 있게 한다.
+                    if self._on_health:
+                        try:
+                            self._on_health(
+                                'dump_analysis_failed',
+                                f'덤프 분석을 {DUMP_ANALYZE_MAX_RETRY}회 시도했으나 '
+                                f'실패해 포기했습니다: {dmp.name} '
+                                f'(ZIP으로 내려받아 수동 분석 필요)')
+                        except Exception:
+                            pass
 
         self._cleanup_dumps()
 
@@ -1325,6 +1422,20 @@ class DumpWatcher:
             dumps = sorted(DUMP_DIR.glob('*.dmp'), key=lambda p: p.stat().st_mtime)
         except OSError:
             return
+
+        # 0) 중단된 덤프 쓰기(_write_dump/_atomic_write_json)가 남긴 고아 임시파일
+        #    (*.dmp.tmp) 정리. 진행 중인 쓰기는 수 초 내이므로, 충분히 오래된(=쓰기가
+        #    끝났을 리 없는) 것만 지워 활성 쓰기를 건드리지 않는다.
+        try:
+            stale_before = datetime.now().timestamp() - 600   # 10분
+            for t in DUMP_DIR.glob('*.dmp.tmp'):
+                if _safe_mtime(t) < stale_before:
+                    try:
+                        t.unlink()
+                    except OSError:
+                        pass
+        except OSError:
+            pass
 
         def _drop(paths):
             for p in paths:
@@ -1371,6 +1482,10 @@ class DumpWatcher:
         # WER 기본 파일명 형식: <프로세스exe>.<PID>.dmp
         proc_name = dmp_path.stem.rsplit('.', 1)[0]
         try:
+            dump_pid = int(dmp_path.stem.rsplit('.', 1)[1])
+        except (IndexError, ValueError):
+            dump_pid = 0   # 예상 밖 파일명 → PID 미상(이름+시각 매칭으로 폴백)
+        try:
             result = subprocess.run(
                 [str(DUMP_ANALYZER_EXE), str(dmp_path)],
                 capture_output=True, text=True, encoding='utf-8', errors='replace',
@@ -1386,7 +1501,7 @@ class DumpWatcher:
         if not text or text.startswith('ANALYZER_ERROR'):
             return 'transient'
         ts = datetime.fromtimestamp(dmp_path.stat().st_mtime)
-        self._on_stack_trace(proc_name, ts, text)
+        self._on_stack_trace(proc_name, dump_pid, ts, text)
         return 'ok'
 
 
@@ -1397,7 +1512,8 @@ def _make_report(ev: CrashEvent) -> str:
         f'[이지랩 QA 크래시 리포트]\n{sep}\n'
         f'발생 시각   : {ev.timestamp.strftime("%Y-%m-%d %H:%M:%S")}\n'
         f'앱          : {ev.app_name}  ({ev.process})\n'
-        f'유형        : {ev.error_type}\n'
+        + (f'앱 버전     : {ev.app_version}\n' if ev.app_version else '')
+        + f'유형        : {ev.error_type}\n'
         f'{sep}\n\n'
         f'요약\n{ev.summary}\n\n'
         f'원문 로그\n{"─"*52}\n{ev.detail}'
@@ -2674,14 +2790,25 @@ class HistoryWindow:
 
     @staticmethod
     def _matching_dumps(ev: CrashEvent, window_sec: int = 300) -> list:
-        """이벤트와 프로세스명·시각이 맞는 덤프 파일 목록.
-        파일명은 WER LocalDumps 형식 <exe>.<pid>.dmp (HangWatcher도 동일)."""
+        """이벤트에 연결된 덤프 파일 목록.
+        파일명은 WER LocalDumps 형식 <exe>.<pid>.dmp (HangWatcher도 동일).
+        이벤트에 PID가 있으면(hang 등) 파일명 PID와 정확히 일치하는 덤프만 담아,
+        같은 exe의 다른 인스턴스/다른 크래시 덤프가 섞이지 않게 한다. PID가
+        없으면(0) 기존처럼 프로세스명+시각 근접으로 폴백한다."""
         out = []
         try:
             for dmp in DUMP_DIR.glob('*.dmp'):
-                base = dmp.stem.rsplit('.', 1)[0]
+                parts = dmp.stem.rsplit('.', 1)
+                base  = parts[0]
                 if base.lower() != ev.process.lower():
                     continue
+                if ev.pid:
+                    try:
+                        dump_pid = int(parts[1])
+                    except (IndexError, ValueError):
+                        dump_pid = 0
+                    if dump_pid != ev.pid:
+                        continue
                 mtime = datetime.fromtimestamp(dmp.stat().st_mtime)
                 if abs((ev.timestamp - mtime).total_seconds()) <= window_sec:
                     out.append(dmp)
@@ -2789,9 +2916,12 @@ class StatusWindow:
     """모니터가 제대로 감시하고 있는지 한 화면에서 확인한다: WER 등록,
     덤프 폴더 쓰기 권한, 디스크 여유, DumpAnalyzer 존재, 마지막 정상 폴링."""
 
-    def __init__(self, get_runtime: Callable, on_close: Callable = None):
+    def __init__(self, get_runtime: Callable, on_close: Callable = None,
+                 get_health: Callable = None):
         # get_runtime(): (last_checked: Optional[datetime], consec_fail: int) 반환
+        # get_health(limit): 최근 헬스 기록 list[dict] 반환 (없으면 None)
         self._get_runtime = get_runtime
+        self._get_health  = get_health
         self._on_close = on_close
         self._root: Optional[tk.Tk] = None
         self._body: Optional[tk.Frame] = None
@@ -2808,7 +2938,7 @@ class StatusWindow:
         self._root = root
         root.title('모니터 상태 점검')
         root.configure(bg=BG)
-        root.geometry('480x430')
+        root.geometry('480x640')
         root.resizable(False, False)
         try:
             if LOGO_ICO.exists():
@@ -2837,8 +2967,23 @@ class StatusWindow:
                   bd=1, highlightbackground=BORDER).pack(side=tk.RIGHT)
 
         root.protocol('WM_DELETE_WINDOW', self._close)
+        self._fit_height()
         root.after(120, lambda: (root.lift(), root.focus_force()))
         root.mainloop()
+
+    def _fit_height(self):
+        """내용에 맞춰 창 높이를 조정한다. 상태 행 수(헬스 기록 유무)에 따라
+        필요 높이가 달라지므로 고정 높이로는 하단이 잘릴 수 있다(측정상 최대
+        ~770px). 화면 높이를 상한으로 두어 넘치지 않게 한다."""
+        if self._root is None:
+            return
+        try:
+            self._root.update_idletasks()
+            need = self._root.winfo_reqheight() + 4
+            cap  = self._root.winfo_screenheight() - 60
+            self._root.geometry(f'480x{max(300, min(need, cap))}')
+        except Exception:
+            pass
 
     def _render(self):
         if self._body is None:
@@ -2865,6 +3010,40 @@ class StatusWindow:
         ]
         for title, ok, detail in rows:
             self._row(title, ok, detail)
+
+        self._render_health()
+        self._fit_height()
+
+    def _render_health(self):
+        """모니터가 놓쳤을 수 있는 상태(수집 공백·덤프 분석 실패 등) 최근 기록."""
+        entries = []
+        if self._get_health:
+            try:
+                entries = self._get_health(30) or []
+            except Exception:
+                entries = []
+
+        tk.Frame(self._body, bg=BG, height=8).pack(fill=tk.X)
+        head = tk.Frame(self._body, bg=BG)
+        head.pack(fill=tk.X, pady=(2, 4))
+        tk.Label(head, text='감시 신뢰성 기록', bg=BG, fg=FG,
+                 font=('Segoe UI', 10, 'bold')).pack(side=tk.LEFT)
+
+        if not entries:
+            self._row('놓친 상태 없음', True, '수집 공백·분석 실패 기록이 없습니다')
+            return
+
+        # 창은 고정 크기(스크롤 없음)이므로 최신 3건만 노출해 하단 잘림을 막고,
+        # 나머지는 파일을 참조하도록 안내한다.
+        recent = list(reversed(entries))
+        for e in recent[:3]:
+            ts  = e.get('timestamp', '')
+            msg = e.get('message', '')
+            self._row(ts, False, msg)
+        if len(recent) > 3:
+            tk.Label(self._body,
+                     text='… 그 외 최근 기록은 monitor_health.json 참조',
+                     bg=BG, fg=MUTED, font=('Segoe UI', 8)).pack(anchor='w', pady=(2, 0))
 
     def _row(self, title: str, ok: bool, detail: str):
         card = tk.Frame(self._body, bg=SURFACE)
@@ -2917,6 +3096,11 @@ class QAMonitor:
         self._history: List[CrashEvent] = load_history()
         self._install_history: List[InstallEvent] = load_install_history()
         self._lock = threading.Lock()
+        # 이력 파일 저장을 직렬화한다. 저장 헬퍼는 이 락을 잡은 뒤 스냅샷을
+        # '새로' 떠서 쓴다 → 여러 감시 스레드가 동시에 저장해도 물리적으로
+        # 마지막에 쓰이는 내용이 항상 최신 이력이라, 늦게 도착한 오래된
+        # 스냅샷이 최신 이력을 덮어쓰는 일이 없다.
+        self._save_lock = threading.Lock()
         self._icon: Optional[pystray.Icon] = None
         # AUMID로 만들어야 _register_aumid()가 등록한 표시명/로고가 알림에
         # 나온다. 미지원 OS 등 생성 실패 시 None → _toast가 풍선으로 폴백.
@@ -2924,9 +3108,13 @@ class QAMonitor:
             self._toaster = WindowsToaster(APP_AUMID) if HAS_WINDOWS_TOASTS else None
         except Exception:
             self._toaster = None
+        # 모니터가 놓쳤을 수 있는 상태(수집 공백·덤프 분석 실패 등) 자가 기록
+        self._health = HealthLog()
         self._watcher = EventLogWatcher(self._on_crash, self._on_install, self._on_poll,
-                                        self._on_backfill_done, self._on_wer)
-        self._dump_watcher = DumpWatcher(self._on_stack_trace)
+                                        self._on_backfill_done, self._on_wer,
+                                        on_health=self._health.record)
+        self._dump_watcher = DumpWatcher(self._on_stack_trace,
+                                         on_health=self._health.record)
         self._hang_watcher = HangWatcher(self._on_hang)
         # 최근 WER 부가 보고 (크래시가 나중에 도착하는 경우의 선-첨부용)
         self._recent_wer: deque = deque(maxlen=20)
@@ -2937,6 +3125,22 @@ class QAMonitor:
         # 토스트 억제 상태: (process, error_type) -> (구간 시작시각, 억제된 반복 수)
         self._toast_seen: dict = {}
         self._status_open = False
+
+    def _persist_crash_history(self):
+        """크래시 이력을 디스크에 저장. 반드시 self._lock을 '보유하지 않은'
+        상태에서 호출해야 한다(락 순서: _save_lock → _lock). 스냅샷을 저장 락
+        안에서 새로 뜨므로, 여러 스레드가 저장을 경쟁해도 최신 이력이 보존된다."""
+        with self._save_lock:
+            with self._lock:
+                snapshot = list(self._history)
+            save_history(snapshot)
+
+    def _persist_install_history(self):
+        """설치 이력 저장. 규약은 _persist_crash_history와 동일."""
+        with self._save_lock:
+            with self._lock:
+                snapshot = list(self._install_history)
+            save_install_history(snapshot)
 
     def run(self):
         self._watcher.start()
@@ -3031,17 +3235,17 @@ class QAMonitor:
         label = WER_EVENT_LABELS.get(event_name)
         line  = (f'{ts.strftime("%Y-%m-%d %H:%M:%S")}  {event_name}'
                  + (f' — {label}' if label else ''))
+        dirty = False
         with self._lock:
             self._recent_wer.append((ts, target_exe.lower(), line))
-            snapshot = None
             for ev in reversed(self._history):
                 if (ev.process.lower() == target_exe.lower()
                         and abs((ev.timestamp - ts).total_seconds()) <= WER_CORRELATE_SEC):
                     if self._append_wer_line(ev, line):
-                        snapshot = list(self._history)
+                        dirty = True
                     break
-        if snapshot is not None:
-            save_history(snapshot)
+        if dirty:
+            self._persist_crash_history()
 
     def _on_hang(self, exe: str, pid: int, hung_secs: float, dump_ok: bool,
                  app_label: str = ''):
@@ -3070,7 +3274,8 @@ class QAMonitor:
         ev = CrashEvent(ts, app_label or self._watcher._resolve(exe), exe,
                         '응답 없음 감지 (실시간)',
                         f'UI 응답 없음 {int(hung_secs)}초 경과 — 종료 전 덤프 '
-                        f'{"캡처 완료" if dump_ok else "캡처 실패"}', detail)
+                        f'{"캡처 완료" if dump_ok else "캡처 실패"}', detail,
+                        pid=pid)
         self._on_crash(ev)
 
     def _on_crash(self, ev: CrashEvent, backfill: bool = False):
@@ -3090,9 +3295,8 @@ class QAMonitor:
             # 백필 중에는 건마다 디스크에 쓰지 않고(수백 건이면 O(n²) I/O),
             # _on_backfill_done에서 한 번만 저장한다. watcher_state는 폴이
             # 끝난 뒤에 저장되므로 중간에 죽어도 다음 시작 때 다시 백필된다.
-            snapshot = None if backfill else list(self._history)
-        if snapshot is not None:
-            save_history(snapshot)
+        if not backfill:
+            self._persist_crash_history()
 
         # 백필(미실행 중 발생분)은 이력에만 조용히 추가하고, 토스트/알림은
         # _on_backfill_done에서 합계로 한 번만 띄운다.
@@ -3139,8 +3343,7 @@ class QAMonitor:
             if len(self._install_history) > MAX_HISTORY_ENTRIES:
                 del self._install_history[:len(self._install_history) - MAX_HISTORY_ENTRIES]
             win = self._open_window
-            snapshot = list(self._install_history)
-        save_install_history(snapshot)
+        self._persist_install_history()
         if win:
             win.push_install(ev)
 
@@ -3148,9 +3351,7 @@ class QAMonitor:
         if count <= 0:
             return
         # 백필 동안 미뤄둔 크래시 이력 저장을 여기서 한 번에 수행
-        with self._lock:
-            snapshot = list(self._history)
-        save_history(snapshot)
+        self._persist_crash_history()
         self._alert_showing = True
         if self._icon:
             self._icon.icon  = self._make_tray_icon(alert=True)
@@ -3159,24 +3360,38 @@ class QAMonitor:
         self._toast('[이지랩 QA] 미실행 구간 이벤트 발견', msg,
                     on_click=self._show_history)
 
-    def _on_stack_trace(self, proc_name: str, dump_ts: datetime, stack_text: str):
-        # 덤프에서 분석해낸 관리 코드 스택 트레이스를, 시간/프로세스명이
-        # 가장 가까운 기존 크래시 이력에 덧붙인다. (열려있는 창은 다음에
-        # 다시 열 때 갱신된 내용을 보여준다 — 실시간 갱신은 하지 않음)
+    def _on_stack_trace(self, proc_name: str, dump_pid: int,
+                        dump_ts: datetime, stack_text: str):
+        # 덤프에서 분석해낸 관리 코드 스택 트레이스를 올바른 크래시 이력에 덧붙인다.
+        # 우선순위: (1) 덤프 PID와 이벤트 PID가 정확히 일치 — 같은 exe가 여러
+        # 인스턴스로 돌거나 연속 크래시해도 다른 크래시의 스택이 붙지 않는다.
+        # (2) 이벤트에 PID가 없으면(0) 기존처럼 프로세스명+시각 근접으로 폴백.
+        # (열려있는 창은 다음에 다시 열 때 갱신된 내용을 보여준다 — 실시간 갱신 X)
         with self._lock:
             match = None
-            for ev in reversed(self._history):
-                if (ev.process.lower() == proc_name.lower()
-                        and abs((ev.timestamp - dump_ts).total_seconds()) < 120):
-                    match = ev
-                    break
+            if dump_pid:
+                for ev in reversed(self._history):
+                    if (ev.pid == dump_pid
+                            and ev.process.lower() == proc_name.lower()
+                            and abs((ev.timestamp - dump_ts).total_seconds()) < 120):
+                        match = ev
+                        break
+            if match is None:
+                # PID를 못 얻은 이벤트(pid==0)만 이름+시각으로 폴백 매칭한다.
+                # PID를 가진 이벤트는 (1)에서 걸러야 하며, 여기서 엉뚱한 인스턴스에
+                # 붙는 걸 막기 위해 제외한다.
+                for ev in reversed(self._history):
+                    if (ev.pid == 0
+                            and ev.process.lower() == proc_name.lower()
+                            and abs((ev.timestamp - dump_ts).total_seconds()) < 120):
+                        match = ev
+                        break
             if match is None or '자동 분석된 관리 코드 스택 트레이스' in match.detail:
                 return
             match.detail += (
                 '\n\n[자동 분석된 관리 코드 스택 트레이스]\n' + '─' * 48 + '\n' + stack_text
             )
-            snapshot = list(self._history)
-        save_history(snapshot)
+        self._persist_crash_history()
 
     def _show_history(self, icon=None, item=None):
         with self._lock:
@@ -3209,7 +3424,8 @@ class QAMonitor:
             self._status_open = True
 
         def run_window():
-            win = StatusWindow(lambda: (self._last_checked, self._consec_fail))
+            win = StatusWindow(lambda: (self._last_checked, self._consec_fail),
+                               get_health=self._health.recent)
             try:
                 win.show()
             finally:
@@ -3228,15 +3444,13 @@ class QAMonitor:
         ids = {id(e) for e in evs}
         with self._lock:
             self._history = [e for e in self._history if id(e) not in ids]
-            snapshot = list(self._history)
-        save_history(snapshot)
+        self._persist_crash_history()
 
     def _on_delete_install(self, evs: List[InstallEvent]):
         ids = {id(e) for e in evs}
         with self._lock:
             self._install_history = [e for e in self._install_history if id(e) not in ids]
-            snapshot = list(self._install_history)
-        save_install_history(snapshot)
+        self._persist_install_history()
 
     def _quit(self, icon=None, item=None):
         self._watcher.stop()
